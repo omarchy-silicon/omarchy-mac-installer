@@ -7,19 +7,25 @@ on:
 jobs:
   pure-transaction:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.13']
     steps:
       - name: Checkout without submodules
         uses: actions/checkout@v4
         with:
           submodules: false
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
 
       - name: Run pure transaction tests
         run: tests/run-transaction-tests.sh
+
+      - name: Run pure credential-state tests
+        run: tests/run-credential-state-tests.sh
 
       - name: AST, shell, import, and destructive-operation safety checks
         run: |
@@ -27,23 +33,24 @@ jobs:
           import ast
           from pathlib import Path
 
-          path = Path('src/installer_transaction.py')
-          tree = ast.parse(path.read_text(), filename=str(path))
-          allowed = {'__future__', 'dataclasses', 'enum', 'hashlib', 'json', 're', 'types', 'typing', 'uuid'}
-          for node in ast.walk(tree):
-              if isinstance(node, ast.Import):
-                  names = {alias.name.split('.')[0] for alias in node.names}
-                  if not names <= allowed:
-                      raise SystemExit(f'forbidden import: {sorted(names - allowed)}')
-              elif isinstance(node, ast.ImportFrom):
-                  if node.module is None or node.module.split('.')[0] not in allowed:
-                      raise SystemExit(f'forbidden import: {node.module}')
+          paths = [Path('src/installer_transaction.py'), Path('src/credential_states.py')]
+          allowed = {'__future__', 'dataclasses', 'enum', 'hashlib', 'json', 're', 'threading', 'types', 'typing', 'uuid'}
           forbidden_calls = {'open', 'system', 'run', 'Popen', 'check_call', 'check_output'}
-          for node in ast.walk(tree):
-              if isinstance(node, ast.Call):
-                  name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ''
-                  if name in forbidden_calls:
-                      raise SystemExit(f'forbidden call: {name}')
+          for path in paths:
+              tree = ast.parse(path.read_text(), filename=str(path))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      names = {alias.name.split('.')[0] for alias in node.names}
+                      if not names <= allowed:
+                          raise SystemExit(f'forbidden import in {path}: {sorted(names - allowed)}')
+                  elif isinstance(node, ast.ImportFrom):
+                      if node.module is None or node.module.split('.')[0] not in allowed:
+                          raise SystemExit(f'forbidden import in {path}: {node.module}')
+                  if isinstance(node, ast.Call):
+                      name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ''
+                      if name in forbidden_calls:
+                          raise SystemExit(f'forbidden call in {path}: {name}')
           print('AST/import/destructive scan passed')
           PY
           bash -n tests/run-transaction-tests.sh
+          bash -n tests/run-credential-state-tests.sh

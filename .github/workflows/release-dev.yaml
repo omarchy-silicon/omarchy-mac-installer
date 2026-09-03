@@ -1,8 +1,7 @@
 name: release-dev
 
 on:
-  push:
-    branches: [ main ]
+  # Omarchy fork dev deployment requires owner-authorized dispatch until its signed delivery pipeline exists.
   workflow_dispatch:
 
 jobs:

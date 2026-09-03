@@ -844,6 +844,7 @@ class ConsentAuthority:
     def consume(self, consent: FinalConsent, plan: ReadOnlyInstallerPlan, now: int) -> Consent:
         if not isinstance(consent, FinalConsent) or not isinstance(plan, ReadOnlyInstallerPlan):
             raise ConsentError("consent and exact plan are required")
+        self.__planning_authority.verify_plan(plan)
         _strict_time(now, "consent use")
         if now < consent.issued_at or now >= consent.expires_at:
             raise ConsentExpiredError("final consent is expired")

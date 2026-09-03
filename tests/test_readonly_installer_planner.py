@@ -197,6 +197,8 @@ class PlannerTests(unittest.TestCase):
         readiness_authority = ConsumptionAuthority(ledger)
         consent_authority = ConsentAuthority(authority)
         consent = consent_authority.issue(plan, readiness, readiness_authority, now, now + 100)
+        with self.assertRaises(PlannerAuthorityError):
+            consent_authority.consume(consent, copy(plan), now + 1)
         tx_consent = consent_authority.consume(consent, plan, now + 1)
         self.assertEqual(tx_consent.plan_digest, plan.plan_digest)
         with self.assertRaises(ConsentConsumedError):

@@ -2,7 +2,7 @@ import json
 import sys
 import threading
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
@@ -272,6 +272,43 @@ class CredentialStateTests(unittest.TestCase):
         errors = [value for value in outcomes if isinstance(value, Exception)]
         self.assertEqual(len(errors), 11)
         self.assertTrue(all(isinstance(error, ReadinessAlreadyConsumedError) and str(error) == "ALREADY_CONSUMED" for error in errors))
+
+    def test_unregistered_fake_checkpoint_and_attestation_are_rejected(self):
+        state = ready_state(receipt(AuthorizationKind.MACOS_ADMINISTRATOR), receipt(AuthorizationKind.MACHINE_OWNER, "opaque-owner"))
+        decision, ledger = ready_decision(state)
+        authority = ConsumptionAuthority(ledger)
+        attestation = require_readiness_for_i01(decision, MACHINE, BOARD, PLAN, 150, authority)
+        checkpoint = authority.checkpoint_for(decision)
+        self.assertIsNotNone(checkpoint)
+        fake_checkpoint = checkpoint.__class__(
+            checkpoint.decision_digest, checkpoint.machine_id, checkpoint.board_id,
+            checkpoint.plan_digest, checkpoint.receipt_digests, checkpoint.ledger_checkpoint_id,
+            checkpoint.consumed_at, "fake-authority", checkpoint.authority_revision,
+        )
+        fake = object.__new__(ReadinessAttestation)
+        for name in ("machine_id", "board_id", "plan_digest", "decision_digest", "authority_id", "authority_revision", "consumed_at", "receipt_digests", "ledger_checkpoint_id", "_receipt_ids"):
+            object.__setattr__(fake, name, getattr(attestation, name))
+        object.__setattr__(fake, "consumption_checkpoint_digest", fake_checkpoint.digest)
+        with self.assertRaises(CredentialReadinessError):
+            authority.verify_attestation(fake, decision, MACHINE, BOARD, PLAN, 150)
+        with self.assertRaises(CredentialTypeError):
+            authority.verify_attestation(object(), decision, MACHINE, BOARD, PLAN, 150)
+        with self.assertRaises(Exception):
+            replace(attestation, consumed_at=151)
+
+    def test_authority_verification_rejects_tampering_and_copied_fields(self):
+        state = ready_state(receipt(AuthorizationKind.MACOS_ADMINISTRATOR), receipt(AuthorizationKind.MACHINE_OWNER, "opaque-owner"))
+        decision, ledger = ready_decision(state)
+        authority = ConsumptionAuthority(ledger)
+        attestation = require_readiness_for_i01(decision, MACHINE, BOARD, PLAN, 150, authority)
+        copied = object.__new__(ReadinessAttestation)
+        for name in ("machine_id", "board_id", "plan_digest", "decision_digest", "consumption_checkpoint_digest", "authority_id", "authority_revision", "consumed_at", "receipt_digests", "ledger_checkpoint_id", "_receipt_ids"):
+            object.__setattr__(copied, name, getattr(attestation, name))
+        with self.assertRaises(CredentialReadinessError):
+            authority.verify_attestation(copied, decision, MACHINE, BOARD, PLAN, 150)
+        object.__setattr__(attestation, "consumed_at", 151)
+        with self.assertRaises(CredentialReadinessError):
+            authority.verify_attestation(attestation, decision, MACHINE, BOARD, PLAN, 150)
 
 
 if __name__ == "__main__":

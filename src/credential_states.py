@@ -629,6 +629,8 @@ class ConsumptionCheckpoint:
     receipt_digests: tuple[str, ...]
     ledger_checkpoint_id: str
     consumed_at: int
+    authority_id: str = "unbound"
+    authority_revision: int = 0
 
     def __post_init__(self) -> None:
         _digest(self.decision_digest, "decision")
@@ -641,6 +643,9 @@ class ConsumptionCheckpoint:
             _digest(digest, "receipt")
         _opaque(self.ledger_checkpoint_id, "ledger checkpoint id")
         _strict_time(self.consumed_at, "consumption")
+        _opaque(self.authority_id, "authority id")
+        if type(self.authority_revision) is not int or self.authority_revision <= 0:
+            raise CredentialTypeError("invalid authority revision")
 
     @property
     def digest(self) -> str:
@@ -656,6 +661,8 @@ class ConsumptionCheckpoint:
             "receipt_digests": list(self.receipt_digests),
             "ledger_checkpoint_id": self.ledger_checkpoint_id,
             "consumed_at": self.consumed_at,
+            "authority_id": self.authority_id,
+            "authority_revision": self.authority_revision,
             "durability": "in_process_only",
             "cross_process_persistence": CROSS_PROCESS_PERSISTENCE_RESIDUAL,
         }
@@ -672,7 +679,10 @@ class ConsumptionAuthority:
             raise CredentialTypeError("consumption authority requires a receipt ledger")
         self._lock = threading.Lock()
         self._ledger = ledger
+        self._authority_id = uuid.uuid4().hex
+        self._revision = 0
         self._consumed: dict[tuple[str, tuple[str, ...], str, str, str], ConsumptionCheckpoint] = {}
+        self._issued: dict[str, ReadinessAttestation] = {}
 
     @property
     def ledger(self) -> ReceiptLedger:
@@ -733,13 +743,69 @@ class ConsumptionAuthority:
                 tuple(sorted(_domain_digest("omarchy-receipt-envelope/v1", receipt.to_dict()) for receipt in decision._receipts)),
                 self._ledger.checkpoint_id,
                 now,
+                self._authority_id,
+                self._revision + 1,
             )
+            self._revision += 1
             self._ledger = ReceiptLedger(
                 self._ledger.consumed_receipt_ids | {receipt.receipt_id for receipt in decision._receipts},
                 self._ledger.checkpoint_id,
             )
             self._consumed[key] = checkpoint
-            return ReadinessAttestation._from_consumption(decision, checkpoint)
+            attestation = object.__new__(ReadinessAttestation)
+            object.__setattr__(attestation, "machine_id", decision.machine_id)
+            object.__setattr__(attestation, "board_id", decision.board_id)
+            object.__setattr__(attestation, "plan_digest", decision.plan_digest)
+            object.__setattr__(attestation, "decision_digest", decision.digest)
+            object.__setattr__(attestation, "consumption_checkpoint_digest", checkpoint.digest)
+            object.__setattr__(attestation, "authority_id", self._authority_id)
+            object.__setattr__(attestation, "authority_revision", self._revision)
+            object.__setattr__(attestation, "consumed_at", now)
+            object.__setattr__(attestation, "receipt_digests", checkpoint.receipt_digests)
+            object.__setattr__(attestation, "ledger_checkpoint_id", checkpoint.ledger_checkpoint_id)
+            object.__setattr__(attestation, "_receipt_ids", tuple(sorted(receipt.receipt_id for receipt in decision._receipts)))
+            self._issued[attestation.digest] = attestation
+            return attestation
+
+    def verify_attestation(
+        self,
+        attestation: "ReadinessAttestation",
+        decision: ReadinessDecision,
+        machine_id: str,
+        board_id: str,
+        plan_digest: str,
+        now: int,
+    ) -> None:
+        """Verify an in-process attestation is the exact registered issuance."""
+        if not isinstance(attestation, ReadinessAttestation):
+            raise CredentialTypeError("readiness attestation is required")
+        if not isinstance(decision, ReadinessDecision):
+            raise CredentialTypeError("readiness decision is required")
+        _strict_time(now, "verification")
+        if (machine_id, board_id, plan_digest) != (decision.machine_id, decision.board_id, decision.plan_digest):
+            raise CredentialBindingError("readiness attestation binding mismatch")
+        with self._lock:
+            registered = self._issued.get(attestation.digest)
+            if registered is not attestation:
+                raise CredentialReadinessError("ATTESTATION_NOT_REGISTERED")
+            checkpoint = self._consumed.get(self._key(decision))
+            if checkpoint is None:
+                raise CredentialReadinessError("ATTESTATION_NOT_REGISTERED")
+            expected_ids = tuple(sorted(receipt.receipt_id for receipt in decision._receipts))
+            if (
+                attestation.decision_digest != decision.digest
+                or attestation.machine_id != machine_id
+                or attestation.board_id != board_id
+                or attestation.plan_digest != plan_digest
+                or attestation.authority_id != self._authority_id
+                or attestation.authority_revision != checkpoint.authority_revision
+                or attestation.consumed_at != checkpoint.consumed_at
+                or attestation.ledger_checkpoint_id != checkpoint.ledger_checkpoint_id
+                or attestation.consumption_checkpoint_digest != checkpoint.digest
+                or attestation.receipt_digests != checkpoint.receipt_digests
+                or attestation._receipt_ids != expected_ids
+            ):
+                raise CredentialReadinessError("ATTESTATION_BINDING_MISMATCH")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -751,6 +817,12 @@ class ReadinessAttestation:
     plan_digest: str
     decision_digest: str
     consumption_checkpoint_digest: str
+    authority_id: str
+    authority_revision: int
+    consumed_at: int
+    receipt_digests: tuple[str, ...]
+    ledger_checkpoint_id: str
+    _receipt_ids: tuple[str, ...] = field(repr=False, compare=False)
 
     def __init__(self, machine_id: str, board_id: str, plan_digest: str, decision_digest: str) -> None:
         raise CredentialReadinessError("readiness attestations must come from a derived decision")
@@ -761,19 +833,9 @@ class ReadinessAttestation:
         _digest(self.plan_digest, "plan")
         _digest(self.decision_digest, "decision")
 
-    @classmethod
-    def _from_consumption(cls, decision: ReadinessDecision, checkpoint: ConsumptionCheckpoint) -> Self:
-        instance = object.__new__(cls)
-        object.__setattr__(instance, "machine_id", decision.machine_id)
-        object.__setattr__(instance, "board_id", decision.board_id)
-        object.__setattr__(instance, "plan_digest", decision.plan_digest)
-        object.__setattr__(instance, "decision_digest", decision.digest)
-        object.__setattr__(instance, "consumption_checkpoint_digest", checkpoint.digest)
-        return instance
-
-    def validate(self, machine_id: str, board_id: str, plan_digest: str) -> None:
-        if (machine_id, board_id, plan_digest) != (self.machine_id, self.board_id, self.plan_digest):
-            raise CredentialBindingError("readiness attestation binding mismatch")
+    @property
+    def digest(self) -> str:
+        return _domain_digest("omarchy-readiness-attestation/v1", self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -783,6 +845,11 @@ class ReadinessAttestation:
             "plan_digest": self.plan_digest,
             "decision_digest": self.decision_digest,
             "consumption_checkpoint_digest": self.consumption_checkpoint_digest,
+            "authority_id": self.authority_id,
+            "authority_revision": self.authority_revision,
+            "consumed_at": self.consumed_at,
+            "receipt_digests": list(self.receipt_digests),
+            "ledger_checkpoint_id": self.ledger_checkpoint_id,
         }
 
 
@@ -799,7 +866,9 @@ def require_readiness_for_i01(
         raise CredentialTypeError("readiness decision is required before final consent")
     if not isinstance(authority, ConsumptionAuthority):
         raise CredentialTypeError("consumption authority is required before final consent")
-    return decision.consume(machine_id, board_id, plan_digest, now, authority)
+    attestation = decision.consume(machine_id, board_id, plan_digest, now, authority)
+    authority.verify_attestation(attestation, decision, machine_id, board_id, plan_digest, now)
+    return attestation
 
 
 # Compatibility names make the distinct vocabulary explicit at call sites.

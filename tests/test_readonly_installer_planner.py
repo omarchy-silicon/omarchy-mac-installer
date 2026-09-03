@@ -51,6 +51,7 @@ from readonly_installer_planner import (  # noqa: E402
     TargetError,
     VolumeObservation,
     generate_installer_plan,
+    issue_final_consent,
     parse_inventory_json,
 )
 
@@ -186,6 +187,17 @@ class PlannerTests(unittest.TestCase):
         object.__setattr__(tampered_authority, "_PlanningAuthority__policy_digest", tampered_authority._current_policy_digest())
         with self.assertRaises(PlannerAuthorityError):
             tampered_authority.admit(make_inventory(), CandidateRequest("machine-1", "board-1", "disk-1", "container-1", "volume-1", digest("candidate"), digest("manifest"), digest("schema")), 1100)
+        sealed_authority, sealed_admission = make_admission()
+        with self.assertRaises(AttributeError):
+            object.__setattr__(sealed_authority, "_current_policy_digest", lambda: sealed_authority._PlanningAuthority__policy_digest)
+
+        class EvilPlanningAuthority(PlanningAuthority):
+            def generate_plan(self, *args, **kwargs):
+                return "forged"
+
+        evil = object.__new__(EvilPlanningAuthority)
+        with self.assertRaises(PlannerAuthorityError):
+            generate_installer_plan(evil, sealed_admission, Artifact("image", digest("image"), 100), digest("document"))
 
     def test_consent_is_readiness_bound_and_one_time(self):
         authority, admission = make_admission()
@@ -208,6 +220,14 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(tx_consent.plan_digest, plan.plan_digest)
         with self.assertRaises(ConsentConsumedError):
             consent_authority.consume(consent, plan, now + 1)
+
+        class EvilConsentAuthority(ConsentAuthority):
+            def issue(self, *args, **kwargs):
+                return "forged"
+
+        evil_consent = object.__new__(EvilConsentAuthority)
+        with self.assertRaises(PlannerAuthorityError):
+            issue_final_consent(evil_consent, plan, readiness, readiness_authority, now, now + 100)
 
 
 if __name__ == "__main__":

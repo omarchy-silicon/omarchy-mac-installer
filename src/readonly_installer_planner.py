@@ -600,6 +600,8 @@ class PlanningAuthority:
     this class makes no cryptographic, durable, or cross-process trust claim.
     """
 
+    __slots__ = ("__digests", "__statuses", "__policy_digest", "__lock", "__evidence", "__admissions", "__plans")
+
     def __init__(
         self,
         *,
@@ -800,9 +802,9 @@ class ReadOnlyInstallerPlan:
 
 def generate_installer_plan(authority: PlanningAuthority, admission: CandidateAdmission, artifact: Artifact, document_digest: str) -> ReadOnlyInstallerPlan:
     """Thin public delegator; assembly and registration stay in the authority."""
-    if not isinstance(authority, PlanningAuthority):
+    if type(authority) is not PlanningAuthority:
         raise PlannerAuthorityError("planning authority is required")
-    return authority.generate_plan(admission, artifact, document_digest)
+    return PlanningAuthority.generate_plan(authority, admission, artifact, document_digest)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -847,8 +849,10 @@ class FinalConsent:
 class ConsentAuthority:
     """In-process one-time final-consent authority; no durable claims."""
 
+    __slots__ = ("__planning_authority", "__lock", "__issued", "__consumed")
+
     def __init__(self, planning_authority: PlanningAuthority) -> None:
-        if not isinstance(planning_authority, PlanningAuthority):
+        if type(planning_authority) is not PlanningAuthority:
             raise PlannerAuthorityError("consent authority requires planning authority")
         self.__planning_authority = planning_authority
         self.__lock = threading.Lock()
@@ -906,9 +910,9 @@ class ConsentAuthority:
 
 
 def issue_final_consent(consent_authority: ConsentAuthority, plan: ReadOnlyInstallerPlan, decision: ReadinessDecision, readiness_authority: ConsumptionAuthority, now: int, expires_at: int) -> FinalConsent:
-    if not isinstance(consent_authority, ConsentAuthority):
+    if type(consent_authority) is not ConsentAuthority:
         raise PlannerAuthorityError("consent authority is required")
-    return consent_authority.issue(plan, decision, readiness_authority, now, expires_at)
+    return ConsentAuthority.issue(consent_authority, plan, decision, readiness_authority, now, expires_at)
 
 
 # Compatibility names for callers using the vocabulary from the I-03 design.

@@ -20,7 +20,7 @@ Downstream distributions commonly customize the bootstrap script, installer meta
 
 ## Contributions and security
 
-For actionable work, report issues through the [Omarchy Silicon organization Issues](https://github.com/omarchy-silicon/omarchy-mac-installer/issues). Use the organization's central Discussions for design and coordination. Report security vulnerabilities through the organization's private security channel rather than a public issue.
+For actionable work, report issues through the [central Omarchy Silicon Issues](https://github.com/omarchy-silicon/omarchy-apple-platform/issues). Use [central Discussions](https://github.com/omarchy-silicon/omarchy-apple-platform/discussions) for design and coordination. Report security vulnerabilities through the [central private security advisory form](https://github.com/omarchy-silicon/omarchy-apple-platform/security/advisories/new), never through a public issue or discussion.
 
 ## License and attribution
 

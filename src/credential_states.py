@@ -11,8 +11,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+import threading
+import uuid
 from typing import Any, Mapping, Self
 
 
@@ -74,6 +76,18 @@ class CredentialReadinessError(CredentialStateError):
     pass
 
 
+class ReadinessExpiredError(CredentialReadinessError):
+    pass
+
+
+class ReadinessAlreadyConsumedError(CredentialReadinessError):
+    pass
+
+
+class ReadinessAuthorityStateError(CredentialReadinessError):
+    pass
+
+
 class FileVaultState(StrEnum):
     ENABLED = "enabled"
     DISABLED = "disabled"
@@ -109,6 +123,23 @@ class LinuxEncryptionState(StrEnum):
     CLEARED = "cleared"
     UNKNOWN = "unknown"
     UNAVAILABLE = "unavailable"
+
+    def advance_to(self, target: "LinuxEncryptionState") -> "LinuxEncryptionState":
+        if not isinstance(target, LinuxEncryptionState):
+            raise CredentialTypeError("invalid Linux encryption transition target")
+        allowed = {
+            LinuxEncryptionState.NOT_SELECTED: frozenset({LinuxEncryptionState.CONFIGURED}),
+            LinuxEncryptionState.CONFIGURED: frozenset({LinuxEncryptionState.VERIFIED}),
+            LinuxEncryptionState.VERIFIED: frozenset({LinuxEncryptionState.CLEARED}),
+            LinuxEncryptionState.CLEARED: frozenset(),
+            LinuxEncryptionState.UNKNOWN: frozenset(),
+            LinuxEncryptionState.UNAVAILABLE: frozenset(),
+        }
+        if target not in allowed[self]:
+            raise CredentialDependencyError(
+                f"invalid Linux encryption transition {self.value}->{target.value}"
+            )
+        return target
 
 
 class PairedRecoveryOSState(StrEnum):
@@ -152,6 +183,9 @@ class ReadinessBlocker(StrEnum):
     RECEIPT_MISSING = "authorization_receipt_missing"
     RECEIPT_INVALID = "authorization_receipt_invalid"
     RECEIPT_REUSED = "authorization_receipt_reused"
+
+
+CROSS_PROCESS_PERSISTENCE_RESIDUAL = "durable_cross_process_cas_not_implemented"
 
 
 REQUIRED_STATE_ORDER: tuple[str, ...] = (
@@ -344,12 +378,14 @@ class ReceiptLedger:
     """Immutable one-use receipt ledger; a consumer stores only receipt IDs."""
 
     consumed_receipt_ids: frozenset[str] = frozenset()
+    checkpoint_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def __post_init__(self) -> None:
         if not isinstance(self.consumed_receipt_ids, frozenset):
             raise CredentialTypeError("receipt ledger must be a frozenset")
         if len(self.consumed_receipt_ids) > MAX_RECEIPTS:
             raise CredentialBoundsError("receipt ledger exceeds bound")
+        _opaque(self.checkpoint_id, "ledger checkpoint id")
         for receipt_id in self.consumed_receipt_ids:
             _opaque(receipt_id, "receipt id")
 
@@ -367,7 +403,7 @@ class ReceiptLedger:
         receipt.validate(kind, machine_id, board_id, plan_digest, now)
         if receipt.receipt_id in self.consumed_receipt_ids:
             raise CredentialReceiptError("authorization receipt was already consumed")
-        return type(self)(self.consumed_receipt_ids | {receipt.receipt_id})
+        return type(self)(self.consumed_receipt_ids | {receipt.receipt_id}, self.checkpoint_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,6 +500,9 @@ class ReadinessDecision:
     ready: bool
     blockers: tuple[ReadinessBlocker, ...]
     evaluated_at: int
+    _ledger_checkpoint_id: str = field(repr=False, compare=False)
+    _ledger_consumed_ids: frozenset[str] = field(repr=False, compare=False)
+    _receipts: tuple[AuthorizationReceipt, ...] = field(repr=False, compare=False)
 
     def __init__(
         self,
@@ -490,9 +529,8 @@ class ReadinessDecision:
             raise CredentialTypeError("credential state and receipt ledger are required")
         _strict_time(now, "evaluation")
         blockers: list[ReadinessBlocker] = []
-        if observed_order is not None:
-            if not isinstance(observed_order, tuple) or observed_order != REQUIRED_STATE_ORDER:
-                blockers.append(ReadinessBlocker.DEPENDENCY_ORDER_INVALID)
+        if not isinstance(observed_order, tuple) or observed_order != REQUIRED_STATE_ORDER:
+            blockers.append(ReadinessBlocker.DEPENDENCY_ORDER_INVALID)
         if state.filevault not in {FileVaultState.ENABLED, FileVaultState.DISABLED}:
             blockers.append(ReadinessBlocker.FILEVAULT_UNKNOWN)
         if state.data_volume is not DataVolumeLockState.UNLOCKED:
@@ -501,7 +539,7 @@ class ReadinessDecision:
             blockers.append(ReadinessBlocker.ADMINISTRATOR_NOT_AUTHORIZED)
         if state.machine_owner is not MachineOwnerState.AUTHORIZED:
             blockers.append(ReadinessBlocker.MACHINE_OWNER_NOT_AUTHORIZED)
-        if state.linux_encryption not in {LinuxEncryptionState.CONFIGURED, LinuxEncryptionState.VERIFIED}:
+        if state.linux_encryption is not LinuxEncryptionState.VERIFIED:
             blockers.append(ReadinessBlocker.LINUX_ENCRYPTION_NOT_VERIFIED)
         if state.paired_recovery_os is not PairedRecoveryOSState.PAIRED:
             blockers.append(ReadinessBlocker.RECOVERY_OS_NOT_PAIRED)
@@ -530,9 +568,15 @@ class ReadinessDecision:
                     blockers.append(ReadinessBlocker.RECEIPT_REUSED)
         if len(blockers) > MAX_BLOCKERS:
             raise CredentialBoundsError("readiness blocker count exceeds bound")
-        return object.__new__(cls)._init_derived(state, now, tuple(dict.fromkeys(blockers)))
+        return object.__new__(cls)._init_derived(state, now, tuple(dict.fromkeys(blockers)), ledger)
 
-    def _init_derived(self, state: CredentialState, now: int, blockers: tuple[ReadinessBlocker, ...]) -> Self:
+    def _init_derived(
+        self,
+        state: CredentialState,
+        now: int,
+        blockers: tuple[ReadinessBlocker, ...],
+        ledger: ReceiptLedger,
+    ) -> Self:
         object.__setattr__(self, "machine_id", state.machine_id)
         object.__setattr__(self, "board_id", state.board_id)
         object.__setattr__(self, "plan_digest", state.plan_digest)
@@ -540,6 +584,9 @@ class ReadinessDecision:
         object.__setattr__(self, "ready", not blockers)
         object.__setattr__(self, "blockers", blockers)
         object.__setattr__(self, "evaluated_at", now)
+        object.__setattr__(self, "_ledger_checkpoint_id", ledger.checkpoint_id)
+        object.__setattr__(self, "_ledger_consumed_ids", ledger.consumed_receipt_ids)
+        object.__setattr__(self, "_receipts", state.authorization_receipts)
         return self
 
     @property
@@ -563,15 +610,136 @@ class ReadinessDecision:
         machine_id: str,
         board_id: str,
         plan_digest: str,
-        ledger: ReceiptLedger | None = None,
+        now: int,
+        authority: "ConsumptionAuthority",
     ) -> "ReadinessAttestation":
-        if not self.ready:
+        if not isinstance(authority, ConsumptionAuthority):
+            raise CredentialTypeError("consumption authority is required")
+        return authority.consume(self, machine_id, board_id, plan_digest, now)
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumptionCheckpoint:
+    """Canonical in-process CAS checkpoint; durable CAS remains residual."""
+
+    decision_digest: str
+    machine_id: str
+    board_id: str
+    plan_digest: str
+    receipt_digests: tuple[str, ...]
+    ledger_checkpoint_id: str
+    consumed_at: int
+
+    def __post_init__(self) -> None:
+        _digest(self.decision_digest, "decision")
+        _identifier(self.machine_id, "machine identity")
+        _identifier(self.board_id, "board identity")
+        _digest(self.plan_digest, "plan")
+        if not isinstance(self.receipt_digests, tuple) or len(self.receipt_digests) > MAX_RECEIPTS:
+            raise CredentialTypeError("invalid receipt digest set")
+        for digest in self.receipt_digests:
+            _digest(digest, "receipt")
+        _opaque(self.ledger_checkpoint_id, "ledger checkpoint id")
+        _strict_time(self.consumed_at, "consumption")
+
+    @property
+    def digest(self) -> str:
+        return _domain_digest("omarchy-credential-consumption/v1", self.to_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": "credential-consumption-checkpoint/v1",
+            "decision_digest": self.decision_digest,
+            "machine_id": self.machine_id,
+            "board_id": self.board_id,
+            "plan_digest": self.plan_digest,
+            "receipt_digests": list(self.receipt_digests),
+            "ledger_checkpoint_id": self.ledger_checkpoint_id,
+            "consumed_at": self.consumed_at,
+            "durability": "in_process_only",
+            "cross_process_persistence": CROSS_PROCESS_PERSISTENCE_RESIDUAL,
+        }
+
+    def to_json(self) -> str:
+        return canonical_json(self.to_dict())
+
+
+class ConsumptionAuthority:
+    """Lock-protected compare-and-consume authority for one process."""
+
+    def __init__(self, ledger: ReceiptLedger) -> None:
+        if not isinstance(ledger, ReceiptLedger):
+            raise CredentialTypeError("consumption authority requires a receipt ledger")
+        self._lock = threading.Lock()
+        self._ledger = ledger
+        self._consumed: dict[tuple[str, tuple[str, ...], str, str, str], ConsumptionCheckpoint] = {}
+
+    @property
+    def ledger(self) -> ReceiptLedger:
+        return self._ledger
+
+    def checkpoint_for(self, decision: ReadinessDecision) -> ConsumptionCheckpoint | None:
+        if not isinstance(decision, ReadinessDecision):
+            raise CredentialTypeError("readiness decision is required")
+        with self._lock:
+            return self._consumed.get(self._key(decision))
+
+    @staticmethod
+    def _key(decision: ReadinessDecision) -> tuple[str, tuple[str, ...], str, str, str]:
+        return (
+            decision.digest,
+            tuple(receipt.receipt_id for receipt in decision._receipts),
+            decision.machine_id,
+            decision.board_id,
+            decision.plan_digest,
+        )
+
+    def consume(
+        self,
+        decision: ReadinessDecision,
+        machine_id: str,
+        board_id: str,
+        plan_digest: str,
+        now: int,
+    ) -> "ReadinessAttestation":
+        if not isinstance(decision, ReadinessDecision):
+            raise CredentialTypeError("readiness decision is required")
+        if not decision.ready:
             raise CredentialReadinessError("cannot consume a non-ready decision")
-        if (machine_id, board_id, plan_digest) != (self.machine_id, self.board_id, self.plan_digest):
+        _strict_time(now, "consumption")
+        if (machine_id, board_id, plan_digest) != (decision.machine_id, decision.board_id, decision.plan_digest):
             raise CredentialBindingError("readiness decision binding mismatch")
-        if ledger is not None and not isinstance(ledger, ReceiptLedger):
-            raise CredentialTypeError("receipt ledger has invalid type")
-        return ReadinessAttestation._from_decision(self)
+        key = self._key(decision)
+        with self._lock:
+            if key in self._consumed:
+                raise ReadinessAlreadyConsumedError("ALREADY_CONSUMED")
+            if (
+                self._ledger.checkpoint_id != decision._ledger_checkpoint_id
+                or self._ledger.consumed_receipt_ids != decision._ledger_consumed_ids
+            ):
+                raise ReadinessAuthorityStateError("AUTHORITY_STATE_MISMATCH")
+            for receipt in decision._receipts:
+                try:
+                    receipt.validate(receipt.kind, decision.machine_id, decision.board_id, decision.plan_digest, now)
+                except CredentialReceiptError as exc:
+                    raise ReadinessExpiredError("READINESS_EXPIRED") from exc
+                if receipt.receipt_id in self._ledger.consumed_receipt_ids:
+                    raise ReadinessAuthorityStateError("AUTHORITY_STATE_MISMATCH")
+            checkpoint = ConsumptionCheckpoint(
+                decision.digest,
+                decision.machine_id,
+                decision.board_id,
+                decision.plan_digest,
+                tuple(sorted(_domain_digest("omarchy-receipt-envelope/v1", receipt.to_dict()) for receipt in decision._receipts)),
+                self._ledger.checkpoint_id,
+                now,
+            )
+            self._ledger = ReceiptLedger(
+                self._ledger.consumed_receipt_ids | {receipt.receipt_id for receipt in decision._receipts},
+                self._ledger.checkpoint_id,
+            )
+            self._consumed[key] = checkpoint
+            return ReadinessAttestation._from_consumption(decision, checkpoint)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -582,6 +750,7 @@ class ReadinessAttestation:
     board_id: str
     plan_digest: str
     decision_digest: str
+    consumption_checkpoint_digest: str
 
     def __init__(self, machine_id: str, board_id: str, plan_digest: str, decision_digest: str) -> None:
         raise CredentialReadinessError("readiness attestations must come from a derived decision")
@@ -593,12 +762,13 @@ class ReadinessAttestation:
         _digest(self.decision_digest, "decision")
 
     @classmethod
-    def _from_decision(cls, decision: ReadinessDecision) -> Self:
+    def _from_consumption(cls, decision: ReadinessDecision, checkpoint: ConsumptionCheckpoint) -> Self:
         instance = object.__new__(cls)
         object.__setattr__(instance, "machine_id", decision.machine_id)
         object.__setattr__(instance, "board_id", decision.board_id)
         object.__setattr__(instance, "plan_digest", decision.plan_digest)
         object.__setattr__(instance, "decision_digest", decision.digest)
+        object.__setattr__(instance, "consumption_checkpoint_digest", checkpoint.digest)
         return instance
 
     def validate(self, machine_id: str, board_id: str, plan_digest: str) -> None:
@@ -612,6 +782,7 @@ class ReadinessAttestation:
             "board_id": self.board_id,
             "plan_digest": self.plan_digest,
             "decision_digest": self.decision_digest,
+            "consumption_checkpoint_digest": self.consumption_checkpoint_digest,
         }
 
 
@@ -620,11 +791,15 @@ def require_readiness_for_i01(
     machine_id: str,
     board_id: str,
     plan_digest: str,
+    now: int,
+    authority: ConsumptionAuthority,
 ) -> ReadinessAttestation:
     """The explicit I-01 handoff; mutation code should require this result."""
     if not isinstance(decision, ReadinessDecision):
         raise CredentialTypeError("readiness decision is required before final consent")
-    return decision.consume(machine_id, board_id, plan_digest)
+    if not isinstance(authority, ConsumptionAuthority):
+        raise CredentialTypeError("consumption authority is required before final consent")
+    return decision.consume(machine_id, board_id, plan_digest, now, authority)
 
 
 # Compatibility names make the distinct vocabulary explicit at call sites.
@@ -641,13 +816,15 @@ OneTRReadiness = OneTRState
 
 
 __all__ = [
-    "AuthorizationKind", "AuthorizationReceipt", "CredentialBindingError", "CredentialBoundsError",
-    "CredentialDependencyError", "CredentialReadinessError", "CredentialSecretError",
+    "AuthorizationKind", "AuthorizationReceipt", "ConsumptionAuthority", "ConsumptionCheckpoint",
+    "CredentialBindingError", "CredentialBoundsError", "CredentialDependencyError",
+    "CredentialReadinessError", "CredentialSecretError",
     "CredentialSerializationError", "CredentialState", "CredentialStateError", "CredentialTypeError",
     "DataVolumeLockState", "DataVolumeStatus", "FileVaultState", "FileVaultStatus",
     "LinuxEncryptionSetupState", "LinuxEncryptionState", "MacOSAdminState", "MacOSAdministratorState",
     "MacOSAdministratorStatus", "MachineOwnerState", "MachineOwnerStatus", "OneTRReadiness", "OneTRState",
     "OneTrueRecoveryState", "PairedRecoveryOSAvailability", "PairedRecoveryOSState", "PairedRecoveryOSStatus",
-    "ReadinessAttestation", "ReadinessBlocker", "ReadinessDecision",
+    "ReadinessAlreadyConsumedError", "ReadinessAttestation", "ReadinessAuthorityStateError",
+    "ReadinessBlocker", "ReadinessDecision", "ReadinessExpiredError",
     "ReceiptLedger", "REQUIRED_STATE_ORDER", "canonical_bytes", "canonical_json", "require_readiness_for_i01",
 ]

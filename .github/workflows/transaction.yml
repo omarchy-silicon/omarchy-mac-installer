@@ -34,7 +34,7 @@ jobs:
           from pathlib import Path
 
           paths = [Path('src/installer_transaction.py'), Path('src/credential_states.py')]
-          allowed = {'__future__', 'dataclasses', 'enum', 'hashlib', 'json', 're', 'types', 'typing', 'uuid'}
+          allowed = {'__future__', 'dataclasses', 'enum', 'hashlib', 'json', 're', 'threading', 'types', 'typing', 'uuid'}
           forbidden_calls = {'open', 'system', 'run', 'Popen', 'check_call', 'check_output'}
           for path in paths:
               tree = ast.parse(path.read_text(), filename=str(path))

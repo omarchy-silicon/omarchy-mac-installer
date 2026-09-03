@@ -1,5 +1,6 @@
 import json
 import sys
+import threading
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -9,9 +10,14 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from credential_states import (  # noqa: E402
     AuthorizationKind,
     AuthorizationReceipt,
+    ConsumptionAuthority,
     CredentialBindingError,
     CredentialReadinessError,
     CredentialReceiptError,
+    CredentialDependencyError,
+    ReadinessAlreadyConsumedError,
+    ReadinessAuthorityStateError,
+    ReadinessExpiredError,
     CredentialSecretError,
     CredentialState,
     CredentialTypeError,
@@ -57,6 +63,11 @@ def ready_state(*receipts: AuthorizationReceipt) -> CredentialState:
     )
 
 
+def ready_decision(state: CredentialState, ledger: ReceiptLedger | None = None):
+    current_ledger = ReceiptLedger() if ledger is None else ledger
+    return state.evaluate(150, current_ledger, REQUIRED_STATE_ORDER), current_ledger
+
+
 class CredentialStateTests(unittest.TestCase):
     def test_seven_facts_are_distinct_and_closed(self):
         state = ready_state(
@@ -99,12 +110,13 @@ class CredentialStateTests(unittest.TestCase):
             receipt(AuthorizationKind.MACOS_ADMINISTRATOR),
             receipt(AuthorizationKind.MACHINE_OWNER, "opaque-owner"),
         )
-        decision = state.evaluate(150)
+        decision, ledger = ready_decision(state)
         self.assertTrue(decision.ready)
-        attestation = require_readiness_for_i01(decision, MACHINE, BOARD, PLAN)
+        authority = ConsumptionAuthority(ledger)
+        attestation = require_readiness_for_i01(decision, MACHINE, BOARD, PLAN, 150, authority)
         self.assertEqual(attestation.plan_digest, PLAN)
         with self.assertRaises(CredentialBindingError):
-            require_readiness_for_i01(decision, MACHINE, BOARD, "b" * 64)
+            require_readiness_for_i01(decision, MACHINE, BOARD, "b" * 64, 150, authority)
         with self.assertRaises(CredentialReadinessError):
             ReadinessDecision(MACHINE, BOARD, PLAN, decision.state_digest, True, (), 150)
         with self.assertRaises(CredentialReadinessError):
@@ -112,7 +124,7 @@ class CredentialStateTests(unittest.TestCase):
 
     def test_false_ready_laundering_and_missing_dependencies_fail_closed(self):
         state = ready_state(receipt(AuthorizationKind.MACOS_ADMINISTRATOR, "opaque-admin"))
-        decision = state.evaluate(150)
+        decision = state.evaluate(150, ReceiptLedger(), REQUIRED_STATE_ORDER)
         self.assertFalse(decision.ready)
         self.assertIn(ReadinessBlocker.RECEIPT_MISSING, decision.blockers)
         self.assertIn(ReadinessBlocker.ONE_TR_NOT_READY, ready_state(
@@ -123,7 +135,7 @@ class CredentialStateTests(unittest.TestCase):
                     (receipt(AuthorizationKind.MACOS_ADMINISTRATOR), receipt(AuthorizationKind.MACHINE_OWNER, "opaque-owner")),
         ).evaluate(150).blockers)
         with self.assertRaises(CredentialReadinessError):
-            decision.consume(MACHINE, BOARD, PLAN)
+            decision.consume(MACHINE, BOARD, PLAN, 150, ConsumptionAuthority(ReceiptLedger()))
 
     def test_unknown_and_unavailable_are_not_ready(self):
         for enum_type, value, field in (
@@ -144,7 +156,7 @@ class CredentialStateTests(unittest.TestCase):
                 "authorization_receipts": (receipt(AuthorizationKind.MACOS_ADMINISTRATOR), receipt(AuthorizationKind.MACHINE_OWNER, "opaque-owner")),
             }
             values[field] = value
-            self.assertFalse(CredentialState(**values).evaluate(150).ready, enum_type)
+            self.assertFalse(CredentialState(**values).evaluate(150, ReceiptLedger(), REQUIRED_STATE_ORDER).ready, enum_type)
 
     def test_receipts_are_exact_kind_bound_expiring_and_single_use(self):
         admin = receipt(AuthorizationKind.MACOS_ADMINISTRATOR)
@@ -187,6 +199,79 @@ class CredentialStateTests(unittest.TestCase):
         decision = state.evaluate(150, observed_order=tuple(reversed(REQUIRED_STATE_ORDER)))
         self.assertFalse(decision.ready)
         self.assertEqual(decision.blockers[0], ReadinessBlocker.DEPENDENCY_ORDER_INVALID)
+
+    def test_missing_dependency_order_and_configured_linux_are_not_ready(self):
+        state = ready_state(receipt(AuthorizationKind.MACOS_ADMINISTRATOR), receipt(AuthorizationKind.MACHINE_OWNER, "opaque-owner"))
+        self.assertFalse(state.evaluate(150, ReceiptLedger()).ready)
+        configured = CredentialState(
+            MACHINE, BOARD, PLAN, FileVaultState.ENABLED, DataVolumeLockState.UNLOCKED,
+            MacOSAdministratorState.AUTHORIZED, MachineOwnerState.AUTHORIZED,
+            LinuxEncryptionState.CONFIGURED, PairedRecoveryOSState.PAIRED, OneTRState.READY,
+            state.authorization_receipts,
+        )
+        decision = configured.evaluate(150, ReceiptLedger(), REQUIRED_STATE_ORDER)
+        self.assertFalse(decision.ready)
+        self.assertIn(ReadinessBlocker.LINUX_ENCRYPTION_NOT_VERIFIED, decision.blockers)
+        self.assertEqual(
+            LinuxEncryptionState.NOT_SELECTED.advance_to(LinuxEncryptionState.CONFIGURED),
+            LinuxEncryptionState.CONFIGURED,
+        )
+        self.assertEqual(
+            LinuxEncryptionState.CONFIGURED.advance_to(LinuxEncryptionState.VERIFIED),
+            LinuxEncryptionState.VERIFIED,
+        )
+        with self.assertRaises(CredentialDependencyError):
+            LinuxEncryptionState.NOT_SELECTED.advance_to(LinuxEncryptionState.VERIFIED)
+
+    def test_consumption_requires_authority_and_exact_ledger_checkpoint(self):
+        state = ready_state(receipt(AuthorizationKind.MACOS_ADMINISTRATOR), receipt(AuthorizationKind.MACHINE_OWNER, "opaque-owner"))
+        decision, ledger = ready_decision(state)
+        with self.assertRaises(CredentialTypeError):
+            require_readiness_for_i01(decision, MACHINE, BOARD, PLAN, 150, None)
+        with self.assertRaises(ReadinessAuthorityStateError):
+            require_readiness_for_i01(decision, MACHINE, BOARD, PLAN, 150, ConsumptionAuthority(ReceiptLedger()))
+        authority = ConsumptionAuthority(ledger)
+        require_readiness_for_i01(decision, MACHINE, BOARD, PLAN, 150, authority)
+        with self.assertRaises(ReadinessAlreadyConsumedError) as caught:
+            require_readiness_for_i01(decision, MACHINE, BOARD, PLAN, 150, authority)
+        self.assertEqual(str(caught.exception), "ALREADY_CONSUMED")
+
+    def test_consumption_revalidates_receipt_expiry(self):
+        state = ready_state(
+            AuthorizationReceipt.issue(AuthorizationKind.MACOS_ADMINISTRATOR, MACHINE, BOARD, PLAN, 100, 200, "admin-expiring"),
+            AuthorizationReceipt.issue(AuthorizationKind.MACHINE_OWNER, MACHINE, BOARD, PLAN, 100, 200, "owner-expiring"),
+        )
+        ledger = ReceiptLedger()
+        decision = state.evaluate(150, ledger, REQUIRED_STATE_ORDER)
+        self.assertTrue(decision.ready)
+        with self.assertRaises(ReadinessExpiredError) as caught:
+            require_readiness_for_i01(decision, MACHINE, BOARD, PLAN, 200, ConsumptionAuthority(ledger))
+        self.assertEqual(str(caught.exception), "READINESS_EXPIRED")
+
+    def test_concurrent_duplicate_consumption_has_one_winner(self):
+        state = ready_state(receipt(AuthorizationKind.MACOS_ADMINISTRATOR), receipt(AuthorizationKind.MACHINE_OWNER, "opaque-owner"))
+        decision, ledger = ready_decision(state)
+        authority = ConsumptionAuthority(ledger)
+        outcomes: list[object] = []
+        lock = threading.Lock()
+
+        def consume() -> None:
+            try:
+                value = require_readiness_for_i01(decision, MACHINE, BOARD, PLAN, 150, authority)
+            except Exception as error:  # assertions below classify every result
+                value = error
+            with lock:
+                outcomes.append(value)
+
+        threads = [threading.Thread(target=consume) for _ in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(isinstance(value, ReadinessAttestation) for value in outcomes), 1)
+        errors = [value for value in outcomes if isinstance(value, Exception)]
+        self.assertEqual(len(errors), 11)
+        self.assertTrue(all(isinstance(error, ReadinessAlreadyConsumedError) and str(error) == "ALREADY_CONSUMED" for error in errors))
 
 
 if __name__ == "__main__":

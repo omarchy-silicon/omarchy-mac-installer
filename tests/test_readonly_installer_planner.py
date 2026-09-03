@@ -2,6 +2,7 @@ import hashlib
 import json
 import sys
 import unittest
+from copy import copy
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -38,11 +39,14 @@ from readonly_installer_planner import (  # noqa: E402
     EncryptionState,
     Geometry,
     InputSchemaError,
+    InputBoundsError,
     InventoryObservation,
     MachineObservation,
     MediaKind,
     MountState,
     QualificationState,
+    PlanningAuthority,
+    PlannerAuthorityError,
     TargetError,
     VolumeObservation,
     generate_installer_plan,
@@ -68,13 +72,19 @@ def make_admission(now=1100, **request_changes):
     values = {"machine_id": "machine-1", "board_id": "board-1", "disk_id": "disk-1", "container_id": "container-1", "volume_id": "volume-1", "candidate_digest": digest("candidate"), "manifest_digest": digest("manifest"), "schema_digest": digest("schema")}
     values.update(request_changes)
     request = CandidateRequest(**values)
-    evidence = CandidateEvidence(digest("f02"), digest("q00"), digest("q01"), digest("f05"), values["candidate_digest"], values["manifest_digest"], values["schema_digest"])
-    return CandidateAdmission.admit(inventory, request, evidence, now)
+    authority = PlanningAuthority(
+        f02_digest=digest("f02"), q00_digest=digest("q00"), q01_digest=digest("q01"), f05_digest=digest("f05"),
+        candidate_digest=values["candidate_digest"], manifest_digest=values["manifest_digest"], schema_digest=values["schema_digest"],
+        f02_status=QualificationState.QUALIFIED, q00_status=QualificationState.QUALIFIED,
+        q01_status=QualificationState.QUALIFIED, f05_status=QualificationState.QUALIFIED,
+    )
+    evidence = authority.issue_evidence()
+    return authority, authority.admit(inventory, request, now, evidence)
 
 
 class PlannerTests(unittest.TestCase):
     def test_closed_inventory_and_identity(self):
-        admission = make_admission()
+        _, admission = make_admission()
         self.assertEqual(admission.target.board_id, "board-1")
         with self.assertRaises(FrozenInstanceError):
             admission.target.machine_id = "other"
@@ -92,30 +102,72 @@ class PlannerTests(unittest.TestCase):
         duplicate = '{"version":"inventory-observation/v1","version":"inventory-observation/v1"}'
         with self.assertRaises(InputSchemaError):
             parse_inventory_json(duplicate)
+        with self.assertRaises(InputSchemaError):
+            parse_inventory_json("\ud800")
+        with self.assertRaises(InputBoundsError):
+            parse_inventory_json("[" * 2000 + "0" + "]" * 2000)
+
+    def test_geometry_is_checked_only_within_one_parent(self):
+        inventory = make_inventory()
+        disk_two = DiskObservation("disk-2", "machine-1", Geometry(0, 1000), MediaKind.INTERNAL, MountState.UNMOUNTED, BusyState.IDLE, EncryptionState.CLEAR, QualificationState.QUALIFIED)
+        container_two = APFSContainerObservation("container-2", "machine-1", "disk-2", Geometry(100, 800), MountState.UNMOUNTED, BusyState.IDLE, EncryptionState.CLEAR, QualificationState.QUALIFIED)
+        InventoryObservation(inventory.machine, inventory.board, (inventory.disks[0], disk_two), (inventory.containers[0], container_two), inventory.volumes)
+        disjoint = APFSContainerObservation("container-2", "machine-1", "disk-1", Geometry(0, 100), MountState.UNMOUNTED, BusyState.IDLE, EncryptionState.CLEAR, QualificationState.QUALIFIED)
+        InventoryObservation(inventory.machine, inventory.board, inventory.disks, (inventory.containers[0], disjoint), ())
+        overlapping = APFSContainerObservation("container-2", "machine-1", "disk-1", Geometry(500, 500), MountState.UNMOUNTED, BusyState.IDLE, EncryptionState.CLEAR, QualificationState.QUALIFIED)
+        with self.assertRaises(Exception):
+            InventoryObservation(inventory.machine, inventory.board, inventory.disks, (inventory.containers[0], overlapping), ())
 
     def test_admission_rejects_stale_external_and_unknown(self):
         with self.assertRaises(CandidateAdmissionError):
             make_admission(now=1401)
+        authority, _ = make_admission()
         inventory = make_inventory()
         external = DiskObservation("disk-1", "machine-1", Geometry(0, 1000), MediaKind.EXTERNAL, MountState.UNMOUNTED, BusyState.IDLE, EncryptionState.CLEAR, QualificationState.QUALIFIED)
         with self.assertRaises(TargetError):
-            CandidateAdmission.admit(InventoryObservation(inventory.machine, inventory.board, (external,), inventory.containers, inventory.volumes), CandidateRequest("machine-1", "board-1", "disk-1", "container-1", "volume-1", digest("candidate"), digest("manifest"), digest("schema")), CandidateEvidence(digest("f02"), digest("q00"), digest("q01"), digest("f05"), digest("candidate"), digest("manifest"), digest("schema")), 1100)
+            authority.admit(InventoryObservation(inventory.machine, inventory.board, (external,), inventory.containers, inventory.volumes), CandidateRequest("machine-1", "board-1", "disk-1", "container-1", "volume-1", digest("candidate"), digest("manifest"), digest("schema")), 1100)
 
     def test_plan_is_deterministic_and_target_bound(self):
-        admission = make_admission()
+        authority, admission = make_admission()
         artifact = Artifact("image", digest("image"), 100)
-        first = generate_installer_plan(admission, artifact, digest("document"))
-        second = generate_installer_plan(admission, artifact, digest("document"))
+        first = generate_installer_plan(authority, admission, artifact, digest("document"))
+        second = generate_installer_plan(authority, admission, artifact, digest("document"))
         self.assertEqual(first.digest, second.digest)
         self.assertEqual(first.plan_digest, first.transaction_plan.digest)
         self.assertEqual(tuple(item.value for item in first.destructive_operations), ("CONFIGURE_BOOT", "PROVISION_VOLUME"))
         with self.assertRaises(FrozenInstanceError):
             first.target = first.target
 
+    def test_authority_rejects_fabrication_copy_tamper_and_cross_authority(self):
+        authority, admission = make_admission()
+        with self.assertRaises(CandidateAdmissionError):
+            CandidateEvidence(digest("f02"), digest("q00"), digest("q01"), digest("f05"), digest("candidate"), digest("manifest"), digest("schema"), QualificationState.QUALIFIED, QualificationState.QUALIFIED, QualificationState.QUALIFIED, QualificationState.QUALIFIED)
+        forged_admission = object.__new__(type(admission))
+        for name in ("inventory_digest", "evidence", "target", "admitted_at"):
+            object.__setattr__(forged_admission, name, getattr(admission, name))
+        with self.assertRaises(PlannerAuthorityError):
+            authority.verify_admission(forged_admission)
+        with self.assertRaises(PlannerAuthorityError):
+            authority.verify_admission(copy(admission))
+        object.__setattr__(admission, "admitted_at", admission.admitted_at + 1)
+        with self.assertRaises(PlannerAuthorityError):
+            authority.verify_admission(admission)
+        other, other_admission = make_admission()
+        with self.assertRaises(PlannerAuthorityError):
+            generate_installer_plan(other, admission, Artifact("image", digest("image"), 100), digest("document"))
+        plan = generate_installer_plan(other, other_admission, Artifact("image", digest("image"), 100), digest("document"))
+        forged_plan = object.__new__(type(plan))
+        for name in ("transaction_plan", "target", "admission_digest", "candidate_digest", "manifest_digest", "schema_digest", "destructive_operations"):
+            object.__setattr__(forged_plan, name, getattr(plan, name))
+        with self.assertRaises(PlannerAuthorityError):
+            other.verify_plan(forged_plan)
+        with self.assertRaises(PlannerAuthorityError):
+            other.verify_plan(copy(plan))
+
     def test_consent_is_readiness_bound_and_one_time(self):
-        admission = make_admission()
+        authority, admission = make_admission()
         artifact = Artifact("image", digest("image"), 100)
-        plan = generate_installer_plan(admission, artifact, digest("document"))
+        plan = generate_installer_plan(authority, admission, artifact, digest("document"))
         now = 1100
         receipts = (
             AuthorizationReceipt.issue(AuthorizationKind.MACOS_ADMINISTRATOR, "machine-1", "board-1", plan.plan_digest, now - 1, now + 100, "admin-receipt"),
@@ -126,7 +178,7 @@ class PlannerTests(unittest.TestCase):
         readiness = ReadinessDecision.from_state(state, now, ledger, REQUIRED_STATE_ORDER)
         readiness_authority = ConsumptionAuthority(ledger)
         consent_authority = ConsentAuthority()
-        consent = consent_authority.issue(plan, readiness, readiness_authority, now, now + 100)
+        consent = consent_authority.issue(authority, plan, readiness, readiness_authority, now, now + 100)
         tx_consent = consent_authority.consume(consent, plan, now + 1)
         self.assertEqual(tx_consent.plan_digest, plan.plan_digest)
         with self.assertRaises(ConsentConsumedError):

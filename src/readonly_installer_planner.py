@@ -347,7 +347,7 @@ def _ordered_unique(items: tuple[Any, ...], label: str, identity: str) -> None:
 
 def _no_overlap(items: tuple[Any, ...], label: str) -> None:
     ranges = sorted((item.geometry.start_bytes, item.geometry.end_bytes) for item in items)
-    if any(start < previous_end for (start, _), (previous_start, previous_end) in zip(ranges, ranges[1:])):
+    if any(next_start < previous_end for (_, previous_end), (next_start, _) in zip(ranges, ranges[1:])):
         raise ObservationError(f"overlapping {label} geometry")
 
 
@@ -368,7 +368,6 @@ class InventoryObservation:
             if not isinstance(collection, tuple) or len(collection) > MAX_COLLECTION_ITEMS or any(not isinstance(item, typ) for item in collection):
                 raise InputSchemaError(f"invalid {label} observations")
             _ordered_unique(collection, label, {"disk": "disk_id", "container": "container_id", "volume": "volume_id"}[label])
-        _no_overlap(self.disks, "disk")
         for disk in self.disks:
             if disk.machine_id != self.machine.machine_id:
                 raise ObservationError("disk machine binding mismatch")
@@ -423,12 +422,18 @@ def parse_inventory_json(value: str | bytes) -> InventoryObservation:
     """Parse exactly one bounded inventory document; never touches the host."""
     if not isinstance(value, (str, bytes)):
         raise InputSchemaError("inventory input must be text or bytes")
-    raw = value.encode("utf-8") if isinstance(value, str) else value
-    if len(raw) > MAX_INPUT_BYTES:
-        raise InputBoundsError("inventory input exceeds bound")
     try:
+        raw = value.encode("utf-8") if isinstance(value, str) else value
+        if len(raw) > MAX_INPUT_BYTES:
+            raise InputBoundsError("inventory input exceeds bound")
         document = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs, parse_constant=lambda _: (_ for _ in ()).throw(InputSchemaError("non-finite JSON number")))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except UnicodeEncodeError as exc:
+        raise InputSchemaError("inventory input is not valid UTF-8") from exc
+    except UnicodeDecodeError as exc:
+        raise InputSchemaError("invalid inventory JSON") from exc
+    except RecursionError as exc:
+        raise InputBoundsError("JSON nesting exceeds bound") from exc
+    except json.JSONDecodeError as exc:
         raise InputSchemaError("invalid inventory JSON") from exc
     _check_tree(document)
     if not isinstance(document, Mapping):
@@ -497,7 +502,7 @@ class TargetIdentity:
         return {"machine_id": self.machine_id, "board_id": self.board_id, "disk_id": self.disk_id, "disk_geometry": self.disk_geometry.to_dict(), "container_id": self.container_id, "container_geometry": self.container_geometry.to_dict(), "volume_id": self.volume_id, "volume_geometry": self.volume_geometry.to_dict()}
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class CandidateEvidence:
     f02_digest: str
     q00_digest: str
@@ -506,10 +511,46 @@ class CandidateEvidence:
     candidate_digest: str
     manifest_digest: str
     schema_digest: str
-    f02_status: QualificationState = QualificationState.QUALIFIED
-    q00_status: QualificationState = QualificationState.QUALIFIED
-    q01_status: QualificationState = QualificationState.QUALIFIED
-    f05_status: QualificationState = QualificationState.QUALIFIED
+    f02_status: QualificationState
+    q00_status: QualificationState
+    q01_status: QualificationState
+    f05_status: QualificationState
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise CandidateAdmissionError("candidate evidence must be issued by planning authority")
+
+    @classmethod
+    def _derive(
+        cls,
+        f02_digest: str,
+        q00_digest: str,
+        q01_digest: str,
+        f05_digest: str,
+        candidate_digest: str,
+        manifest_digest: str,
+        schema_digest: str,
+        f02_status: QualificationState,
+        q00_status: QualificationState,
+        q01_status: QualificationState,
+        f05_status: QualificationState,
+    ) -> Self:
+        evidence = object.__new__(cls)
+        for name, value in (
+            ("f02_digest", f02_digest),
+            ("q00_digest", q00_digest),
+            ("q01_digest", q01_digest),
+            ("f05_digest", f05_digest),
+            ("candidate_digest", candidate_digest),
+            ("manifest_digest", manifest_digest),
+            ("schema_digest", schema_digest),
+            ("f02_status", f02_status),
+            ("q00_status", q00_status),
+            ("q01_status", q01_status),
+            ("f05_status", f05_status),
+        ):
+            object.__setattr__(evidence, name, value)
+        evidence.__post_init__()
+        return evidence
 
     def __post_init__(self) -> None:
         for value, label in ((self.f02_digest, "F-02"), (self.q00_digest, "Q-00"), (self.q01_digest, "Q-01"), (self.f05_digest, "F-05"), (self.candidate_digest, "candidate"), (self.manifest_digest, "manifest"), (self.schema_digest, "schema")):
@@ -554,7 +595,7 @@ class CandidateAdmission:
         raise CandidateAdmissionError("candidate admission must be derived")
 
     @classmethod
-    def admit(cls, inventory: InventoryObservation, request: CandidateRequest, evidence: CandidateEvidence, now: int) -> Self:
+    def _derive(cls, inventory: InventoryObservation, request: CandidateRequest, evidence: CandidateEvidence, now: int) -> Self:
         if not isinstance(inventory, InventoryObservation) or not isinstance(request, CandidateRequest) or not isinstance(evidence, CandidateEvidence):
             raise CandidateAdmissionError("inventory, request, and evidence are required")
         _strict_time(now, "admission")
@@ -595,6 +636,91 @@ class CandidateAdmission:
         return {"version": "candidate-admission/v1", "inventory_digest": self.inventory_digest, "evidence": self.evidence.to_dict(), "target": self.target.to_dict(), "admitted_at": self.admitted_at}
 
 
+class PlanningAuthority:
+    """In-process authority for exact evidence, admissions, and plans."""
+
+    def __init__(
+        self,
+        *,
+        f02_digest: str,
+        q00_digest: str,
+        q01_digest: str,
+        f05_digest: str,
+        candidate_digest: str,
+        manifest_digest: str,
+        schema_digest: str,
+        f02_status: QualificationState,
+        q00_status: QualificationState,
+        q01_status: QualificationState,
+        f05_status: QualificationState,
+    ) -> None:
+        self._digests = tuple((value, label) for value, label in ((f02_digest, "F-02"), (q00_digest, "Q-00"), (q01_digest, "Q-01"), (f05_digest, "F-05"), (candidate_digest, "candidate"), (manifest_digest, "manifest"), (schema_digest, "schema")))
+        for value, label in self._digests:
+            _strict_digest(value, label)
+        self._statuses = (f02_status, q00_status, q01_status, f05_status)
+        for status, label in zip(self._statuses, ("F-02", "Q-00", "Q-01", "F-05")):
+            _enum(status, QualificationState, label)
+        self._lock = threading.Lock()
+        self._evidence: dict[int, tuple[CandidateEvidence, str]] = {}
+        self._admissions: dict[int, tuple[CandidateAdmission, str]] = {}
+        self._plans: dict[int, tuple[ReadOnlyInstallerPlan, str]] = {}
+
+    def issue_evidence(self) -> CandidateEvidence:
+        evidence = CandidateEvidence._derive(
+            self._digests[0][0], self._digests[1][0], self._digests[2][0], self._digests[3][0],
+            self._digests[4][0], self._digests[5][0], self._digests[6][0], *self._statuses,
+        )
+        self._register(self._evidence, evidence)
+        return evidence
+
+    def admit(self, inventory: InventoryObservation, request: CandidateRequest, now: int, evidence: CandidateEvidence | None = None) -> CandidateAdmission:
+        if evidence is None:
+            evidence = self.issue_evidence()
+        else:
+            self.verify_evidence(evidence)
+        admission = CandidateAdmission._derive(inventory, request, evidence, now)
+        self._register(self._admissions, admission)
+        return admission
+
+    def _register(self, store: dict[int, tuple[Any, str]], value: Any) -> None:
+        snapshot = value.digest
+        with self._lock:
+            store[id(value)] = (value, snapshot)
+
+    def _verify(self, store: dict[int, tuple[Any, str]], value: Any, label: str) -> None:
+        with self._lock:
+            record = store.get(id(value))
+            if record is None or record[0] is not value:
+                raise PlannerAuthorityError(f"{label} is not registered by this authority")
+            try:
+                current = value.digest
+            except Exception as exc:
+                raise PlannerAuthorityError(f"{label} is malformed") from exc
+            if current != record[1]:
+                raise PlannerAuthorityError(f"{label} changed after registration")
+
+    def verify_evidence(self, evidence: CandidateEvidence) -> None:
+        if not isinstance(evidence, CandidateEvidence):
+            raise PlannerAuthorityError("candidate evidence is required")
+        self._verify(self._evidence, evidence, "candidate evidence")
+
+    def verify_admission(self, admission: CandidateAdmission) -> None:
+        if not isinstance(admission, CandidateAdmission):
+            raise PlannerAuthorityError("candidate admission is required")
+        self._verify(self._admissions, admission, "candidate admission")
+        self.verify_evidence(admission.evidence)
+
+    def _register_plan(self, plan: ReadOnlyInstallerPlan) -> None:
+        if not isinstance(plan, ReadOnlyInstallerPlan):
+            raise PlannerAuthorityError("installer plan is required")
+        self._register(self._plans, plan)
+
+    def verify_plan(self, plan: ReadOnlyInstallerPlan) -> None:
+        if not isinstance(plan, ReadOnlyInstallerPlan):
+            raise PlannerAuthorityError("installer plan is required")
+        self._verify(self._plans, plan, "installer plan")
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ReadOnlyInstallerPlan:
     transaction_plan: InstallerPlan
@@ -631,10 +757,11 @@ class ReadOnlyInstallerPlan:
         return {"version": "readonly-installer-plan/v1", "transaction_plan": self.transaction_plan.to_dict(), "target": self.target.to_dict(), "admission_digest": self.admission_digest, "candidate_digest": self.candidate_digest, "manifest_digest": self.manifest_digest, "schema_digest": self.schema_digest, "destructive_operations": [item.value for item in self.destructive_operations]}
 
 
-def generate_installer_plan(admission: CandidateAdmission, artifact: Artifact, document_digest: str) -> ReadOnlyInstallerPlan:
+def generate_installer_plan(authority: PlanningAuthority, admission: CandidateAdmission, artifact: Artifact, document_digest: str) -> ReadOnlyInstallerPlan:
     """Generate the one deterministic plan shape; this function only plans."""
-    if not isinstance(admission, CandidateAdmission) or not isinstance(artifact, Artifact):
-        raise PlannerAuthorityError("admission and artifact are required")
+    if not isinstance(authority, PlanningAuthority) or not isinstance(admission, CandidateAdmission) or not isinstance(artifact, Artifact):
+        raise PlannerAuthorityError("planning authority, admission, and artifact are required")
+    authority.verify_admission(admission)
     _strict_digest(document_digest, "document")
     target = admission.target
     operation_id = "op-" + _digest_for("omarchy-operation/v1", {"admission": admission.digest, "artifact": artifact.digest, "document": document_digest})[:32]
@@ -661,6 +788,7 @@ def generate_installer_plan(admission: CandidateAdmission, artifact: Artifact, d
     object.__setattr__(plan, "schema_digest", admission.evidence.schema_digest)
     object.__setattr__(plan, "destructive_operations", tuple(sorted((DestructiveOperation.CONFIGURE_BOOT, DestructiveOperation.PROVISION_VOLUME), key=lambda item: item.value)))
     plan.__post_init__()
+    authority._register_plan(plan)
     return plan
 
 
@@ -711,9 +839,10 @@ class ConsentAuthority:
         self._issued: dict[str, FinalConsent] = {}
         self._consumed: set[str] = set()
 
-    def issue(self, plan: ReadOnlyInstallerPlan, decision: ReadinessDecision, readiness_authority: ConsumptionAuthority, now: int, expires_at: int) -> FinalConsent:
-        if not isinstance(plan, ReadOnlyInstallerPlan) or not isinstance(decision, ReadinessDecision) or not isinstance(readiness_authority, ConsumptionAuthority):
-            raise PlannerAuthorityError("plan, readiness decision, and readiness authority are required")
+    def issue(self, planning_authority: PlanningAuthority, plan: ReadOnlyInstallerPlan, decision: ReadinessDecision, readiness_authority: ConsumptionAuthority, now: int, expires_at: int) -> FinalConsent:
+        if not isinstance(planning_authority, PlanningAuthority) or not isinstance(plan, ReadOnlyInstallerPlan) or not isinstance(decision, ReadinessDecision) or not isinstance(readiness_authority, ConsumptionAuthority):
+            raise PlannerAuthorityError("planning authority, plan, readiness decision, and readiness authority are required")
+        planning_authority.verify_plan(plan)
         _strict_time(now, "consent issue")
         _strict_time(expires_at, "consent expiry")
         if expires_at <= now or expires_at - now > MAX_CONSENT_LIFETIME:
@@ -759,9 +888,10 @@ class ConsentAuthority:
         return Consent(plan.transaction_plan.operation_id, plan.plan_digest, plan.transaction_plan.document_digest, plan.transaction_plan.artifact.digest, consent.consent_id)
 
 
-def issue_final_consent(plan: ReadOnlyInstallerPlan, decision: ReadinessDecision, readiness_authority: ConsumptionAuthority, now: int, expires_at: int, authority: ConsentAuthority | None = None) -> tuple[FinalConsent, ConsentAuthority]:
-    consent_authority = ConsentAuthority() if authority is None else authority
-    return consent_authority.issue(plan, decision, readiness_authority, now, expires_at), consent_authority
+def issue_final_consent(planning_authority: PlanningAuthority, consent_authority: ConsentAuthority, plan: ReadOnlyInstallerPlan, decision: ReadinessDecision, readiness_authority: ConsumptionAuthority, now: int, expires_at: int) -> FinalConsent:
+    if not isinstance(consent_authority, ConsentAuthority):
+        raise PlannerAuthorityError("consent authority is required")
+    return consent_authority.issue(planning_authority, plan, decision, readiness_authority, now, expires_at)
 
 
 # Compatibility names for callers using the vocabulary from the I-03 design.
@@ -779,5 +909,5 @@ build_installer_plan = generate_installer_plan
 
 
 __all__ = [
-    "APFSContainer", "APFSContainerObservation", "Admission", "BoardIdentityObservation", "BoardObservation", "BusyState", "Candidate", "CandidateAdmission", "CandidateAdmissionError", "CandidateEvidence", "CandidateRequest", "ConsentAuthority", "ConsentConsumedError", "ConsentError", "ConsentExpiredError", "DestructiveOperation", "DiskIdentityObservation", "DiskObservation", "EncryptionState", "FinalConsent", "FinalConsentAuthority", "Geometry", "InputBoundsError", "InputSchemaError", "InventoryObservation", "MachineIdentityObservation", "MachineObservation", "MediaKind", "MountState", "ObservationError", "PlannerError", "PlannerAuthorityError", "PlannerPlan", "QualificationState", "ReadOnlyInstallerPlan", "TargetError", "TargetIdentity", "VolumeIdentityObservation", "VolumeObservation", "build_installer_plan", "generate_installer_plan", "issue_final_consent", "parse_inventory", "parse_inventory_json",
+    "APFSContainer", "APFSContainerObservation", "Admission", "BoardIdentityObservation", "BoardObservation", "BusyState", "Candidate", "CandidateAdmission", "CandidateAdmissionError", "CandidateEvidence", "CandidateRequest", "ConsentAuthority", "ConsentConsumedError", "ConsentError", "ConsentExpiredError", "DestructiveOperation", "DiskIdentityObservation", "DiskObservation", "EncryptionState", "FinalConsent", "FinalConsentAuthority", "Geometry", "InputBoundsError", "InputSchemaError", "InventoryObservation", "MachineIdentityObservation", "MachineObservation", "MediaKind", "MountState", "ObservationError", "PlannerAuthority", "PlannerError", "PlannerAuthorityError", "PlannerPlan", "QualificationState", "ReadOnlyInstallerPlan", "TargetError", "TargetIdentity", "VolumeIdentityObservation", "VolumeObservation", "build_installer_plan", "generate_installer_plan", "issue_final_consent", "parse_inventory", "parse_inventory_json",
 ]

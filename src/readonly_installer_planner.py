@@ -14,7 +14,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Mapping, Self
+from typing import Any, Mapping
 
 from credential_states import (
     ConsumptionAuthority,
@@ -519,39 +519,6 @@ class CandidateEvidence:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise CandidateAdmissionError("candidate evidence must be issued by planning authority")
 
-    @classmethod
-    def _derive(
-        cls,
-        f02_digest: str,
-        q00_digest: str,
-        q01_digest: str,
-        f05_digest: str,
-        candidate_digest: str,
-        manifest_digest: str,
-        schema_digest: str,
-        f02_status: QualificationState,
-        q00_status: QualificationState,
-        q01_status: QualificationState,
-        f05_status: QualificationState,
-    ) -> Self:
-        evidence = object.__new__(cls)
-        for name, value in (
-            ("f02_digest", f02_digest),
-            ("q00_digest", q00_digest),
-            ("q01_digest", q01_digest),
-            ("f05_digest", f05_digest),
-            ("candidate_digest", candidate_digest),
-            ("manifest_digest", manifest_digest),
-            ("schema_digest", schema_digest),
-            ("f02_status", f02_status),
-            ("q00_status", q00_status),
-            ("q01_status", q01_status),
-            ("f05_status", f05_status),
-        ):
-            object.__setattr__(evidence, name, value)
-        evidence.__post_init__()
-        return evidence
-
     def __post_init__(self) -> None:
         for value, label in ((self.f02_digest, "F-02"), (self.q00_digest, "Q-00"), (self.q01_digest, "Q-01"), (self.f05_digest, "F-05"), (self.candidate_digest, "candidate"), (self.manifest_digest, "manifest"), (self.schema_digest, "schema")):
             _strict_digest(value, label)
@@ -594,11 +561,63 @@ class CandidateAdmission:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise CandidateAdmissionError("candidate admission must be derived")
 
-    @classmethod
-    def _derive(cls, inventory: InventoryObservation, request: CandidateRequest, evidence: CandidateEvidence, now: int) -> Self:
-        if not isinstance(inventory, InventoryObservation) or not isinstance(request, CandidateRequest) or not isinstance(evidence, CandidateEvidence):
-            raise CandidateAdmissionError("inventory, request, and evidence are required")
+    @property
+    def digest(self) -> str:
+        return _digest_for("omarchy-candidate-admission/v1", self.to_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"version": "candidate-admission/v1", "inventory_digest": self.inventory_digest, "evidence": self.evidence.to_dict(), "target": self.target.to_dict(), "admitted_at": self.admitted_at}
+
+
+class PlanningAuthority:
+    """Trusted in-process composition-root capability for I-03.
+
+    The configured pins and statuses are a caller-selected trust root for this
+    process only.  A separately created authority is not interchangeable, and
+    this class makes no cryptographic, durable, or cross-process trust claim.
+    """
+
+    def __init__(
+        self,
+        *,
+        f02_digest: str,
+        q00_digest: str,
+        q01_digest: str,
+        f05_digest: str,
+        candidate_digest: str,
+        manifest_digest: str,
+        schema_digest: str,
+        f02_status: QualificationState,
+        q00_status: QualificationState,
+        q01_status: QualificationState,
+        f05_status: QualificationState,
+    ) -> None:
+        self.__digests = tuple((value, label) for value, label in ((f02_digest, "F-02"), (q00_digest, "Q-00"), (q01_digest, "Q-01"), (f05_digest, "F-05"), (candidate_digest, "candidate"), (manifest_digest, "manifest"), (schema_digest, "schema")))
+        for value, label in self.__digests:
+            _strict_digest(value, label)
+        self.__statuses = (f02_status, q00_status, q01_status, f05_status)
+        for status, label in zip(self.__statuses, ("F-02", "Q-00", "Q-01", "F-05")):
+            _enum(status, QualificationState, label)
+        self.__lock = threading.Lock()
+        self.__evidence: dict[int, tuple[CandidateEvidence, str]] = {}
+        self.__admissions: dict[int, tuple[CandidateAdmission, str]] = {}
+        self.__plans: dict[int, tuple[ReadOnlyInstallerPlan, str]] = {}
+
+    def admit(self, inventory: InventoryObservation, request: CandidateRequest, now: int) -> CandidateAdmission:
+        if not isinstance(inventory, InventoryObservation) or not isinstance(request, CandidateRequest):
+            raise CandidateAdmissionError("inventory and request are required")
         _strict_time(now, "admission")
+        evidence = object.__new__(CandidateEvidence)
+        for name, value in (
+            ("f02_digest", self.__digests[0][0]), ("q00_digest", self.__digests[1][0]),
+            ("q01_digest", self.__digests[2][0]), ("f05_digest", self.__digests[3][0]),
+            ("candidate_digest", self.__digests[4][0]), ("manifest_digest", self.__digests[5][0]),
+            ("schema_digest", self.__digests[6][0]), ("f02_status", self.__statuses[0]),
+            ("q00_status", self.__statuses[1]), ("q01_status", self.__statuses[2]),
+            ("f05_status", self.__statuses[3]),
+        ):
+            object.__setattr__(evidence, name, value)
+        evidence.__post_init__()
         if now < inventory.observed_at or now - inventory.observed_at > MAX_OBSERVATION_AGE:
             raise CandidateAdmissionError("inventory observation is stale")
         if inventory.machine.qualification is not QualificationState.QUALIFIED or inventory.board.qualification is not QualificationState.QUALIFIED:
@@ -621,104 +640,80 @@ class CandidateAdmission:
         if any(item.mount is not MountState.UNMOUNTED or item.busy is not BusyState.IDLE or item.encryption is not EncryptionState.CLEAR or item.qualification is not QualificationState.QUALIFIED for item in resources):
             raise TargetError("target is mounted, busy, encrypted, unknown, or not qualified")
         target = TargetIdentity(inventory.machine.machine_id, inventory.board.board_id, disk.disk_id, disk.geometry, container.container_id, container.geometry, volume.volume_id, volume.geometry)
-        admission = object.__new__(cls)
+        admission = object.__new__(CandidateAdmission)
         object.__setattr__(admission, "inventory_digest", inventory.digest)
         object.__setattr__(admission, "evidence", evidence)
         object.__setattr__(admission, "target", target)
         object.__setattr__(admission, "admitted_at", now)
+        with self.__lock:
+            self.__evidence[id(evidence)] = (evidence, evidence.digest)
+            self.__admissions[id(admission)] = (admission, admission.digest)
         return admission
 
-    @property
-    def digest(self) -> str:
-        return _digest_for("omarchy-candidate-admission/v1", self.to_dict())
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"version": "candidate-admission/v1", "inventory_digest": self.inventory_digest, "evidence": self.evidence.to_dict(), "target": self.target.to_dict(), "admitted_at": self.admitted_at}
-
-
-class PlanningAuthority:
-    """In-process authority for exact evidence, admissions, and plans."""
-
-    def __init__(
-        self,
-        *,
-        f02_digest: str,
-        q00_digest: str,
-        q01_digest: str,
-        f05_digest: str,
-        candidate_digest: str,
-        manifest_digest: str,
-        schema_digest: str,
-        f02_status: QualificationState,
-        q00_status: QualificationState,
-        q01_status: QualificationState,
-        f05_status: QualificationState,
-    ) -> None:
-        self._digests = tuple((value, label) for value, label in ((f02_digest, "F-02"), (q00_digest, "Q-00"), (q01_digest, "Q-01"), (f05_digest, "F-05"), (candidate_digest, "candidate"), (manifest_digest, "manifest"), (schema_digest, "schema")))
-        for value, label in self._digests:
-            _strict_digest(value, label)
-        self._statuses = (f02_status, q00_status, q01_status, f05_status)
-        for status, label in zip(self._statuses, ("F-02", "Q-00", "Q-01", "F-05")):
-            _enum(status, QualificationState, label)
-        self._lock = threading.Lock()
-        self._evidence: dict[int, tuple[CandidateEvidence, str]] = {}
-        self._admissions: dict[int, tuple[CandidateAdmission, str]] = {}
-        self._plans: dict[int, tuple[ReadOnlyInstallerPlan, str]] = {}
-
-    def issue_evidence(self) -> CandidateEvidence:
-        evidence = CandidateEvidence._derive(
-            self._digests[0][0], self._digests[1][0], self._digests[2][0], self._digests[3][0],
-            self._digests[4][0], self._digests[5][0], self._digests[6][0], *self._statuses,
-        )
-        self._register(self._evidence, evidence)
-        return evidence
-
-    def admit(self, inventory: InventoryObservation, request: CandidateRequest, now: int, evidence: CandidateEvidence | None = None) -> CandidateAdmission:
-        if evidence is None:
-            evidence = self.issue_evidence()
-        else:
-            self.verify_evidence(evidence)
-        admission = CandidateAdmission._derive(inventory, request, evidence, now)
-        self._register(self._admissions, admission)
-        return admission
-
-    def _register(self, store: dict[int, tuple[Any, str]], value: Any) -> None:
-        snapshot = value.digest
-        with self._lock:
-            store[id(value)] = (value, snapshot)
-
-    def _verify(self, store: dict[int, tuple[Any, str]], value: Any, label: str) -> None:
-        with self._lock:
-            record = store.get(id(value))
-            if record is None or record[0] is not value:
-                raise PlannerAuthorityError(f"{label} is not registered by this authority")
-            try:
-                current = value.digest
-            except Exception as exc:
-                raise PlannerAuthorityError(f"{label} is malformed") from exc
-            if current != record[1]:
-                raise PlannerAuthorityError(f"{label} changed after registration")
-
-    def verify_evidence(self, evidence: CandidateEvidence) -> None:
-        if not isinstance(evidence, CandidateEvidence):
-            raise PlannerAuthorityError("candidate evidence is required")
-        self._verify(self._evidence, evidence, "candidate evidence")
+    def _verify_admission_locked(self, admission: CandidateAdmission) -> None:
+        record = self.__admissions.get(id(admission))
+        if record is None or record[0] is not admission:
+            raise PlannerAuthorityError("candidate admission is unregistered or changed")
+        try:
+            admission_digest = admission.digest
+            evidence = admission.evidence
+        except Exception as exc:
+            raise PlannerAuthorityError("candidate admission is malformed") from exc
+        if admission_digest != record[1]:
+            raise PlannerAuthorityError("candidate admission is unregistered or changed")
+        evidence_record = self.__evidence.get(id(evidence))
+        try:
+            evidence_digest = evidence.digest
+        except Exception as exc:
+            raise PlannerAuthorityError("candidate evidence is malformed") from exc
+        if evidence_record is None or evidence_record[0] is not evidence or evidence_digest != evidence_record[1]:
+            raise PlannerAuthorityError("candidate evidence is unregistered or changed")
 
     def verify_admission(self, admission: CandidateAdmission) -> None:
         if not isinstance(admission, CandidateAdmission):
             raise PlannerAuthorityError("candidate admission is required")
-        self._verify(self._admissions, admission, "candidate admission")
-        self.verify_evidence(admission.evidence)
+        with self.__lock:
+            self._verify_admission_locked(admission)
 
-    def _register_plan(self, plan: ReadOnlyInstallerPlan) -> None:
-        if not isinstance(plan, ReadOnlyInstallerPlan):
-            raise PlannerAuthorityError("installer plan is required")
-        self._register(self._plans, plan)
+    def generate_plan(self, admission: CandidateAdmission, artifact: Artifact, document_digest: str) -> ReadOnlyInstallerPlan:
+        if not isinstance(admission, CandidateAdmission) or not isinstance(artifact, Artifact):
+            raise PlannerAuthorityError("admission and artifact are required")
+        _strict_digest(document_digest, "document")
+        with self.__lock:
+            self._verify_admission_locked(admission)
+            admission_digest = admission.digest
+            target_digest = admission.target.digest
+            target = admission.target
+            evidence = admission.evidence
+            operation_id = "op-" + _digest_for("omarchy-operation/v1", {"admission": admission_digest, "artifact": artifact.digest, "document": document_digest})[:32]
+            tx_plan = InstallerPlan(operation_id, DiskIdentity(target.disk_id, target.disk_geometry.size_bytes), ContainerIdentity(target.container_id, target.disk_id, target.container_geometry.size_bytes), VolumeIdentity(target.volume_id, target.container_id, target.volume_geometry.size_bytes), artifact, document_digest, (PlanStep("acquire", ActionKind.ACQUIRE_ARTIFACT, target.volume_id, "acquire verified artifact"), PlanStep("provision", ActionKind.PROVISION_VOLUME, target.volume_id, "provision target volume"), PlanStep("boot", ActionKind.CONFIGURE_BOOT, target.volume_id, "configure verified boot"), PlanStep("verify", ActionKind.VERIFY_RESULT, target.volume_id, "verify planned result")))
+            plan = object.__new__(ReadOnlyInstallerPlan)
+            object.__setattr__(plan, "transaction_plan", tx_plan)
+            object.__setattr__(plan, "target", target)
+            object.__setattr__(plan, "admission_digest", admission_digest)
+            object.__setattr__(plan, "candidate_digest", evidence.candidate_digest)
+            object.__setattr__(plan, "manifest_digest", evidence.manifest_digest)
+            object.__setattr__(plan, "schema_digest", evidence.schema_digest)
+            object.__setattr__(plan, "destructive_operations", tuple(sorted((DestructiveOperation.CONFIGURE_BOOT, DestructiveOperation.PROVISION_VOLUME), key=lambda item: item.value)))
+            plan.__post_init__()
+            if admission.digest != admission_digest or admission.target.digest != target_digest:
+                raise PlannerAuthorityError("admission changed during plan generation")
+            self.__plans[id(plan)] = (plan, plan.digest)
+            return plan
 
     def verify_plan(self, plan: ReadOnlyInstallerPlan) -> None:
         if not isinstance(plan, ReadOnlyInstallerPlan):
             raise PlannerAuthorityError("installer plan is required")
-        self._verify(self._plans, plan, "installer plan")
+        with self.__lock:
+            record = self.__plans.get(id(plan))
+            if record is None or record[0] is not plan:
+                raise PlannerAuthorityError("installer plan is unregistered or changed")
+            try:
+                digest = plan.digest
+            except Exception as exc:
+                raise PlannerAuthorityError("installer plan is malformed") from exc
+            if digest != record[1]:
+                raise PlannerAuthorityError("installer plan is unregistered or changed")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -758,38 +753,10 @@ class ReadOnlyInstallerPlan:
 
 
 def generate_installer_plan(authority: PlanningAuthority, admission: CandidateAdmission, artifact: Artifact, document_digest: str) -> ReadOnlyInstallerPlan:
-    """Generate the one deterministic plan shape; this function only plans."""
-    if not isinstance(authority, PlanningAuthority) or not isinstance(admission, CandidateAdmission) or not isinstance(artifact, Artifact):
-        raise PlannerAuthorityError("planning authority, admission, and artifact are required")
-    authority.verify_admission(admission)
-    _strict_digest(document_digest, "document")
-    target = admission.target
-    operation_id = "op-" + _digest_for("omarchy-operation/v1", {"admission": admission.digest, "artifact": artifact.digest, "document": document_digest})[:32]
-    tx_plan = InstallerPlan(
-        operation_id,
-        DiskIdentity(target.disk_id, target.disk_geometry.size_bytes),
-        ContainerIdentity(target.container_id, target.disk_id, target.container_geometry.size_bytes),
-        VolumeIdentity(target.volume_id, target.container_id, target.volume_geometry.size_bytes),
-        artifact,
-        document_digest,
-        (
-            PlanStep("acquire", ActionKind.ACQUIRE_ARTIFACT, target.volume_id, "acquire verified artifact"),
-            PlanStep("provision", ActionKind.PROVISION_VOLUME, target.volume_id, "provision target volume"),
-            PlanStep("boot", ActionKind.CONFIGURE_BOOT, target.volume_id, "configure verified boot"),
-            PlanStep("verify", ActionKind.VERIFY_RESULT, target.volume_id, "verify planned result"),
-        ),
-    )
-    plan = object.__new__(ReadOnlyInstallerPlan)
-    object.__setattr__(plan, "transaction_plan", tx_plan)
-    object.__setattr__(plan, "target", target)
-    object.__setattr__(plan, "admission_digest", admission.digest)
-    object.__setattr__(plan, "candidate_digest", admission.evidence.candidate_digest)
-    object.__setattr__(plan, "manifest_digest", admission.evidence.manifest_digest)
-    object.__setattr__(plan, "schema_digest", admission.evidence.schema_digest)
-    object.__setattr__(plan, "destructive_operations", tuple(sorted((DestructiveOperation.CONFIGURE_BOOT, DestructiveOperation.PROVISION_VOLUME), key=lambda item: item.value)))
-    plan.__post_init__()
-    authority._register_plan(plan)
-    return plan
+    """Thin public delegator; assembly and registration stay in the authority."""
+    if not isinstance(authority, PlanningAuthority):
+        raise PlannerAuthorityError("planning authority is required")
+    return authority.generate_plan(admission, artifact, document_digest)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -834,15 +801,18 @@ class FinalConsent:
 class ConsentAuthority:
     """In-process one-time final-consent authority; no durable claims."""
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._issued: dict[str, FinalConsent] = {}
-        self._consumed: set[str] = set()
+    def __init__(self, planning_authority: PlanningAuthority) -> None:
+        if not isinstance(planning_authority, PlanningAuthority):
+            raise PlannerAuthorityError("consent authority requires planning authority")
+        self.__planning_authority = planning_authority
+        self.__lock = threading.Lock()
+        self.__issued: dict[str, FinalConsent] = {}
+        self.__consumed: set[str] = set()
 
-    def issue(self, planning_authority: PlanningAuthority, plan: ReadOnlyInstallerPlan, decision: ReadinessDecision, readiness_authority: ConsumptionAuthority, now: int, expires_at: int) -> FinalConsent:
-        if not isinstance(planning_authority, PlanningAuthority) or not isinstance(plan, ReadOnlyInstallerPlan) or not isinstance(decision, ReadinessDecision) or not isinstance(readiness_authority, ConsumptionAuthority):
-            raise PlannerAuthorityError("planning authority, plan, readiness decision, and readiness authority are required")
-        planning_authority.verify_plan(plan)
+    def issue(self, plan: ReadOnlyInstallerPlan, decision: ReadinessDecision, readiness_authority: ConsumptionAuthority, now: int, expires_at: int) -> FinalConsent:
+        if not isinstance(plan, ReadOnlyInstallerPlan) or not isinstance(decision, ReadinessDecision) or not isinstance(readiness_authority, ConsumptionAuthority):
+            raise PlannerAuthorityError("plan, readiness decision, and readiness authority are required")
+        self.__planning_authority.verify_plan(plan)
         _strict_time(now, "consent issue")
         _strict_time(expires_at, "consent expiry")
         if expires_at <= now or expires_at - now > MAX_CONSENT_LIFETIME:
@@ -867,8 +837,8 @@ class ConsentAuthority:
         object.__setattr__(consent, "expires_at", expires_at)
         object.__setattr__(consent, "consent_id", consent_id)
         consent.__post_init__()
-        with self._lock:
-            self._issued[consent.digest] = consent
+        with self.__lock:
+            self.__issued[consent.digest] = consent
         return consent
 
     def consume(self, consent: FinalConsent, plan: ReadOnlyInstallerPlan, now: int) -> Consent:
@@ -879,19 +849,19 @@ class ConsentAuthority:
             raise ConsentExpiredError("final consent is expired")
         if consent.plan_digest != plan.plan_digest or consent.plan_envelope_digest != plan.digest or consent.target_digest != plan.target.digest or consent.destructive_operations != plan.destructive_operations or (consent.candidate_digest, consent.manifest_digest, consent.schema_digest) != (plan.candidate_digest, plan.manifest_digest, plan.schema_digest):
             raise ConsentError("consent substitution or replay binding mismatch")
-        with self._lock:
-            if self._issued.get(consent.digest) is not consent:
+        with self.__lock:
+            if self.__issued.get(consent.digest) is not consent:
                 raise ConsentError("consent is not issued by this authority")
-            if consent.digest in self._consumed:
+            if consent.digest in self.__consumed:
                 raise ConsentConsumedError("final consent was already consumed")
-            self._consumed.add(consent.digest)
+            self.__consumed.add(consent.digest)
         return Consent(plan.transaction_plan.operation_id, plan.plan_digest, plan.transaction_plan.document_digest, plan.transaction_plan.artifact.digest, consent.consent_id)
 
 
-def issue_final_consent(planning_authority: PlanningAuthority, consent_authority: ConsentAuthority, plan: ReadOnlyInstallerPlan, decision: ReadinessDecision, readiness_authority: ConsumptionAuthority, now: int, expires_at: int) -> FinalConsent:
+def issue_final_consent(consent_authority: ConsentAuthority, plan: ReadOnlyInstallerPlan, decision: ReadinessDecision, readiness_authority: ConsumptionAuthority, now: int, expires_at: int) -> FinalConsent:
     if not isinstance(consent_authority, ConsentAuthority):
         raise PlannerAuthorityError("consent authority is required")
-    return consent_authority.issue(planning_authority, plan, decision, readiness_authority, now, expires_at)
+    return consent_authority.issue(plan, decision, readiness_authority, now, expires_at)
 
 
 # Compatibility names for callers using the vocabulary from the I-03 design.
@@ -909,5 +879,5 @@ build_installer_plan = generate_installer_plan
 
 
 __all__ = [
-    "APFSContainer", "APFSContainerObservation", "Admission", "BoardIdentityObservation", "BoardObservation", "BusyState", "Candidate", "CandidateAdmission", "CandidateAdmissionError", "CandidateEvidence", "CandidateRequest", "ConsentAuthority", "ConsentConsumedError", "ConsentError", "ConsentExpiredError", "DestructiveOperation", "DiskIdentityObservation", "DiskObservation", "EncryptionState", "FinalConsent", "FinalConsentAuthority", "Geometry", "InputBoundsError", "InputSchemaError", "InventoryObservation", "MachineIdentityObservation", "MachineObservation", "MediaKind", "MountState", "ObservationError", "PlannerAuthority", "PlannerError", "PlannerAuthorityError", "PlannerPlan", "QualificationState", "ReadOnlyInstallerPlan", "TargetError", "TargetIdentity", "VolumeIdentityObservation", "VolumeObservation", "build_installer_plan", "generate_installer_plan", "issue_final_consent", "parse_inventory", "parse_inventory_json",
+    "APFSContainer", "APFSContainerObservation", "Admission", "BoardIdentityObservation", "BoardObservation", "BusyState", "Candidate", "CandidateAdmission", "CandidateAdmissionError", "CandidateEvidence", "CandidateRequest", "ConsentAuthority", "ConsentConsumedError", "ConsentError", "ConsentExpiredError", "DestructiveOperation", "DiskIdentityObservation", "DiskObservation", "EncryptionState", "FinalConsent", "FinalConsentAuthority", "Geometry", "InputBoundsError", "InputSchemaError", "InventoryObservation", "MachineIdentityObservation", "MachineObservation", "MediaKind", "MountState", "ObservationError", "PlanningAuthority", "PlannerError", "PlannerAuthorityError", "PlannerPlan", "QualificationState", "ReadOnlyInstallerPlan", "TargetError", "TargetIdentity", "VolumeIdentityObservation", "VolumeObservation", "build_installer_plan", "generate_installer_plan", "issue_final_consent", "parse_inventory", "parse_inventory_json",
 ]

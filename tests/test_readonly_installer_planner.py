@@ -2,7 +2,7 @@ import hashlib
 import json
 import sys
 import unittest
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -44,6 +44,7 @@ from readonly_installer_planner import (  # noqa: E402
     MachineObservation,
     MediaKind,
     MountState,
+    ObservationError,
     QualificationState,
     PlanningAuthority,
     PlannerAuthorityError,
@@ -78,11 +79,20 @@ def make_admission(now=1100, **request_changes):
         f02_status=QualificationState.QUALIFIED, q00_status=QualificationState.QUALIFIED,
         q01_status=QualificationState.QUALIFIED, f05_status=QualificationState.QUALIFIED,
     )
-    evidence = authority.issue_evidence()
-    return authority, authority.admit(inventory, request, now, evidence)
+    return authority, authority.admit(inventory, request, now)
 
 
 class PlannerTests(unittest.TestCase):
+    def test_public_surface_and_import_star(self):
+        namespace = {}
+        exec("from readonly_installer_planner import *", namespace)
+        self.assertIs(namespace["PlanningAuthority"], PlanningAuthority)
+        self.assertNotIn("_derive", vars(CandidateEvidence))
+        self.assertNotIn("_derive", vars(CandidateAdmission))
+        self.assertNotIn("_register", vars(PlanningAuthority))
+        self.assertNotIn("_register_plan", vars(PlanningAuthority))
+        self.assertNotIn("issue_evidence", vars(PlanningAuthority))
+
     def test_closed_inventory_and_identity(self):
         _, admission = make_admission()
         self.assertEqual(admission.target.board_id, "board-1")
@@ -115,7 +125,7 @@ class PlannerTests(unittest.TestCase):
         disjoint = APFSContainerObservation("container-2", "machine-1", "disk-1", Geometry(0, 100), MountState.UNMOUNTED, BusyState.IDLE, EncryptionState.CLEAR, QualificationState.QUALIFIED)
         InventoryObservation(inventory.machine, inventory.board, inventory.disks, (inventory.containers[0], disjoint), ())
         overlapping = APFSContainerObservation("container-2", "machine-1", "disk-1", Geometry(500, 500), MountState.UNMOUNTED, BusyState.IDLE, EncryptionState.CLEAR, QualificationState.QUALIFIED)
-        with self.assertRaises(Exception):
+        with self.assertRaises(ObservationError):
             InventoryObservation(inventory.machine, inventory.board, inventory.disks, (inventory.containers[0], overlapping), ())
 
     def test_admission_rejects_stale_external_and_unknown(self):
@@ -143,12 +153,16 @@ class PlannerTests(unittest.TestCase):
         with self.assertRaises(CandidateAdmissionError):
             CandidateEvidence(digest("f02"), digest("q00"), digest("q01"), digest("f05"), digest("candidate"), digest("manifest"), digest("schema"), QualificationState.QUALIFIED, QualificationState.QUALIFIED, QualificationState.QUALIFIED, QualificationState.QUALIFIED)
         forged_admission = object.__new__(type(admission))
+        with self.assertRaises(PlannerAuthorityError):
+            authority.verify_admission(forged_admission)
         for name in ("inventory_digest", "evidence", "target", "admitted_at"):
             object.__setattr__(forged_admission, name, getattr(admission, name))
         with self.assertRaises(PlannerAuthorityError):
             authority.verify_admission(forged_admission)
         with self.assertRaises(PlannerAuthorityError):
             authority.verify_admission(copy(admission))
+        with self.assertRaises(PlannerAuthorityError):
+            authority.verify_admission(deepcopy(admission))
         object.__setattr__(admission, "admitted_at", admission.admitted_at + 1)
         with self.assertRaises(PlannerAuthorityError):
             authority.verify_admission(admission)
@@ -157,12 +171,16 @@ class PlannerTests(unittest.TestCase):
             generate_installer_plan(other, admission, Artifact("image", digest("image"), 100), digest("document"))
         plan = generate_installer_plan(other, other_admission, Artifact("image", digest("image"), 100), digest("document"))
         forged_plan = object.__new__(type(plan))
+        with self.assertRaises(PlannerAuthorityError):
+            other.verify_plan(forged_plan)
         for name in ("transaction_plan", "target", "admission_digest", "candidate_digest", "manifest_digest", "schema_digest", "destructive_operations"):
             object.__setattr__(forged_plan, name, getattr(plan, name))
         with self.assertRaises(PlannerAuthorityError):
             other.verify_plan(forged_plan)
         with self.assertRaises(PlannerAuthorityError):
             other.verify_plan(copy(plan))
+        with self.assertRaises(PlannerAuthorityError):
+            other.verify_plan(deepcopy(plan))
 
     def test_consent_is_readiness_bound_and_one_time(self):
         authority, admission = make_admission()
@@ -177,8 +195,8 @@ class PlannerTests(unittest.TestCase):
         ledger = ReceiptLedger()
         readiness = ReadinessDecision.from_state(state, now, ledger, REQUIRED_STATE_ORDER)
         readiness_authority = ConsumptionAuthority(ledger)
-        consent_authority = ConsentAuthority()
-        consent = consent_authority.issue(authority, plan, readiness, readiness_authority, now, now + 100)
+        consent_authority = ConsentAuthority(authority)
+        consent = consent_authority.issue(plan, readiness, readiness_authority, now, now + 100)
         tx_consent = consent_authority.consume(consent, plan, now + 1)
         self.assertEqual(tx_consent.plan_digest, plan.plan_digest)
         with self.assertRaises(ConsentConsumedError):

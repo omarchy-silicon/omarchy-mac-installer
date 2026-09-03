@@ -18,6 +18,7 @@ from installer_transaction import (  # noqa: E402
     InstallerPlan,
     InstallerTransaction,
     Journal,
+    JournalCheckpoint,
     JournalEntry,
     JournalIntegrityError,
     MutationError,
@@ -28,6 +29,7 @@ from installer_transaction import (  # noqa: E402
     SecretLeakError,
     TransitionError,
     VolumeIdentity,
+    EventKind,
     resolve_single_target,
 )
 
@@ -81,6 +83,20 @@ class TransactionTests(unittest.TestCase):
             tx.report_success()
         self.assertNotEqual(tx.status, "success")
 
+    def test_replayed_commit_without_completed_steps_is_rejected(self):
+        plan = make_plan()
+        tx = InstallerTransaction.start(plan)
+        for phase in (Phase.ADMISSION, Phase.ACQUISITION, Phase.PLAN_READY, Phase.FINAL_CONSENT):
+            tx = tx.advance(phase)
+        consent = Consent(plan.operation_id, plan.digest, plan.document_digest, plan.artifact.digest)
+        journal = tx.advance(Phase.MUTATION_STARTED, consent).journal
+        journal = journal.append(plan.operation_id, Phase.PROVISIONED, EventKind.PHASE, {})
+        journal = journal.append(plan.operation_id, Phase.BOOT_CONFIGURED, EventKind.PHASE, {})
+        journal = journal.append(plan.operation_id, Phase.COMMITTED, EventKind.PHASE, {})
+        checkpoint = JournalCheckpoint.for_journal(plan.operation_id, plan.digest, journal)
+        with self.assertRaises(JournalIntegrityError):
+            InstallerTransaction(plan, journal, checkpoint)
+
     def test_idempotent_steps_and_mid_step_resume(self):
         plan = make_plan()
         tx = InstallerTransaction.start(plan)
@@ -89,7 +105,7 @@ class TransactionTests(unittest.TestCase):
         consent = Consent(plan.operation_id, plan.digest, plan.document_digest, plan.artifact.digest)
         tx = tx.advance(Phase.MUTATION_STARTED, consent).record_step_started("acquire")
         self.assertIs(tx.record_step_started("acquire"), tx)
-        resumed = InstallerTransaction.start(plan).resume(tx.journal)
+        resumed = InstallerTransaction.start(plan).resume(tx.journal, tx.checkpoint)
         self.assertEqual(resumed.restart_decision, RestartDecision.RESUME_SAFE)
         resumed = resumed.record_step_completed("acquire").record_step_started("provision").record_step_completed("provision")
         self.assertEqual(resumed._completed_steps, {"acquire", "provision"})
@@ -98,8 +114,11 @@ class TransactionTests(unittest.TestCase):
         plan = make_plan()
         tx = InstallerTransaction.start(plan).advance(Phase.ADMISSION)
         entries = list(tx.journal.entries)
+        # A tail can be rebound by an attacker, so only the out-of-band
+        # checkpoint makes this truncation detectable.
+        truncated = Journal(tuple(entries[:-1]))
         with self.assertRaises(JournalIntegrityError):
-            Journal(tuple(entries[:-1]))
+            InstallerTransaction(plan, truncated, tx.checkpoint)
         with self.assertRaises(JournalIntegrityError):
             Journal(tuple(reversed(entries)))
         changed = entries[1]
@@ -110,14 +129,16 @@ class TransactionTests(unittest.TestCase):
     def test_replayed_journal_rejects_skipped_phase(self):
         plan = make_plan()
         journal = InstallerTransaction.start(plan).journal
-        journal = journal.append(plan.operation_id, Phase.PLAN_READY, "PHASE", {})
+        journal = journal.append(plan.operation_id, Phase.PLAN_READY, EventKind.PHASE, {})
         with self.assertRaises(JournalIntegrityError):
-            InstallerTransaction(plan, journal)
+            InstallerTransaction(plan, journal, JournalCheckpoint.for_journal(plan.operation_id, plan.digest, journal))
 
     def test_journal_round_trip_and_closed_transition_table(self):
         plan = make_plan()
         journal = InstallerTransaction.start(plan).advance(Phase.ADMISSION).journal
-        self.assertEqual(Journal.from_json(journal.to_json()), journal)
+        restored = Journal.from_json(journal.to_json())
+        checkpoint = JournalCheckpoint.for_journal(plan.operation_id, plan.digest, journal)
+        self.assertEqual(InstallerTransaction(plan, restored, checkpoint).journal, journal)
         self.assertEqual(ALLOWED_TRANSITIONS[Phase.COMMITTED], frozenset())
 
     def test_wrong_identity_and_ambiguous_target(self):
@@ -141,11 +162,45 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaises(RecoveryRequiredError):
             tx.mark_rolled_back()
         tx = tx.record_compensation("acquire", ActionKind.VERIFY_RESULT, "restore checkpoint")
+        with self.assertRaises(MutationError):
+            tx.record_compensation("provision", ActionKind.VERIFY_RESULT, "never started")
         self.assertEqual(tx.mark_rolled_back().phase, Phase.ROLLED_BACK)
+
+    def test_failure_is_an_event_then_closed_phase_transition(self):
+        plan = make_plan()
+        tx = InstallerTransaction.start(plan)
+        for phase in (Phase.ADMISSION, Phase.ACQUISITION, Phase.PLAN_READY, Phase.FINAL_CONSENT):
+            tx = tx.advance(phase)
+        consent = Consent(plan.operation_id, plan.digest, plan.document_digest, plan.artifact.digest)
+        failed = tx.advance(Phase.MUTATION_STARTED, consent).fail_after_mutation("crash")
+        self.assertEqual([entry.event for entry in failed.journal.entries[-2:]], [EventKind.FAILURE, EventKind.PHASE])
+        self.assertEqual(failed.journal.entries[-2].phase, Phase.MUTATION_STARTED)
+        with self.assertRaises(JournalIntegrityError):
+            forged = InstallerTransaction.start(plan).journal.append(plan.operation_id, Phase.ROLLBACK_REQUIRED, EventKind.FAILURE, {"code": "forged"})
+            InstallerTransaction(plan, forged, JournalCheckpoint.for_journal(plan.operation_id, plan.digest, forged))
+
+    def test_event_schema_and_strict_scalars(self):
+        with self.assertRaises(JournalIntegrityError):
+            Journal().append("op", Phase.INVENTORY, EventKind.PHASE, {})
+        with self.assertRaises(JournalIntegrityError):
+            Journal().append("op", Phase.INVENTORY, EventKind.PHASE, {"plan_digest": "a" * 64, "document_digest": "b" * 64, "artifact_digest": "c" * 64, "extra": "nope"})
+        with self.assertRaises(JournalIntegrityError):
+            JournalEntry.create(True, "op", Phase.INVENTORY, EventKind.PHASE, {"plan_digest": "a" * 64, "document_digest": "b" * 64, "artifact_digest": "c" * 64}, "")
+        with self.assertRaises(JournalIntegrityError):
+            Journal().append("op", Phase.INVENTORY, EventKind.PHASE, {"plan_digest": "a" * 64, "document_digest": "b" * 64, "artifact_digest": "c" * 64, "x": float("nan")})
+
+    def test_checkpoint_is_required_and_plan_bound(self):
+        plan = make_plan()
+        tx = InstallerTransaction.start(plan)
+        with self.assertRaises(TypeError):
+            InstallerTransaction(plan, tx.journal)  # type: ignore[call-arg]
+        wrong = JournalCheckpoint(tx.checkpoint.operation_id, "c" * 64, tx.checkpoint.sequence, tx.checkpoint.head_hash)
+        with self.assertRaises(JournalIntegrityError):
+            InstallerTransaction(plan, tx.journal, wrong)
 
     def test_secret_redaction_and_path_free_serialization(self):
         with self.assertRaises(SecretLeakError):
-            Journal().append("op", Phase.INVENTORY, "EVENT", {"access_token": "secret"})
+            Journal().append("op", Phase.INVENTORY, EventKind.FAILURE, {"access_token": "secret"})
         plan = make_plan()
         serialized = json.dumps(plan.to_dict())
         self.assertNotIn("/", serialized)

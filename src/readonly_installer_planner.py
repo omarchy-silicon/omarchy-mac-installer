@@ -160,6 +160,29 @@ def _digest_for(domain: str, value: Any) -> str:
     return hashlib.sha256(domain.encode("ascii") + b"\x00" + _canonical(value)).hexdigest()
 
 
+def _make_policy_seal() -> tuple[Any, Any]:
+    records: dict[int, tuple[Any, str]] = {}
+    lock = threading.Lock()
+
+    def seal(authority: Any, digest: str) -> None:
+        with lock:
+            existing = records.get(id(authority))
+            if existing is not None:
+                raise PlannerAuthorityError("planning authority policy is already sealed")
+            records[id(authority)] = (authority, digest)
+
+    def verify(authority: Any, digest: str) -> bool:
+        with lock:
+            existing = records.get(id(authority))
+            return existing is not None and existing[0] is authority and existing[1] == digest
+
+    return seal, verify
+
+
+_seal_planning_policy, _verify_planning_policy = _make_policy_seal()
+del _make_policy_seal
+
+
 def _check_no_float(value: Any, location: str = "$") -> None:
     if isinstance(value, float):
         raise InputSchemaError(f"floating-point value at {location}")
@@ -598,14 +621,34 @@ class PlanningAuthority:
         self.__statuses = (f02_status, q00_status, q01_status, f05_status)
         for status, label in zip(self.__statuses, ("F-02", "Q-00", "Q-01", "F-05")):
             _enum(status, QualificationState, label)
+        self.__policy_digest = self._current_policy_digest()
+        _seal_planning_policy(self, self.__policy_digest)
         self.__lock = threading.Lock()
         self.__evidence: dict[int, tuple[CandidateEvidence, str]] = {}
         self.__admissions: dict[int, tuple[CandidateAdmission, str]] = {}
         self.__plans: dict[int, tuple[ReadOnlyInstallerPlan, str]] = {}
 
+    def _current_policy_digest(self) -> str:
+        return _digest_for(
+            "omarchy-planning-authority-policy/v1",
+            {
+                "digests": [{"value": value, "label": label} for value, label in self.__digests],
+                "statuses": [status.value for status in self.__statuses],
+            },
+        )
+
+    def _require_unchanged_policy(self) -> None:
+        try:
+            current = self._current_policy_digest()
+        except Exception as exc:
+            raise PlannerAuthorityError("planning authority policy is malformed") from exc
+        if current != self.__policy_digest or not _verify_planning_policy(self, current):
+            raise PlannerAuthorityError("planning authority policy changed after initialization")
+
     def admit(self, inventory: InventoryObservation, request: CandidateRequest, now: int) -> CandidateAdmission:
         if not isinstance(inventory, InventoryObservation) or not isinstance(request, CandidateRequest):
             raise CandidateAdmissionError("inventory and request are required")
+        self._require_unchanged_policy()
         _strict_time(now, "admission")
         evidence = object.__new__(CandidateEvidence)
         for name, value in (
@@ -672,12 +715,14 @@ class PlanningAuthority:
     def verify_admission(self, admission: CandidateAdmission) -> None:
         if not isinstance(admission, CandidateAdmission):
             raise PlannerAuthorityError("candidate admission is required")
+        self._require_unchanged_policy()
         with self.__lock:
             self._verify_admission_locked(admission)
 
     def generate_plan(self, admission: CandidateAdmission, artifact: Artifact, document_digest: str) -> ReadOnlyInstallerPlan:
         if not isinstance(admission, CandidateAdmission) or not isinstance(artifact, Artifact):
             raise PlannerAuthorityError("admission and artifact are required")
+        self._require_unchanged_policy()
         _strict_digest(document_digest, "document")
         with self.__lock:
             self._verify_admission_locked(admission)
@@ -704,6 +749,7 @@ class PlanningAuthority:
     def verify_plan(self, plan: ReadOnlyInstallerPlan) -> None:
         if not isinstance(plan, ReadOnlyInstallerPlan):
             raise PlannerAuthorityError("installer plan is required")
+        self._require_unchanged_policy()
         with self.__lock:
             record = self.__plans.get(id(plan))
             if record is None or record[0] is not plan:

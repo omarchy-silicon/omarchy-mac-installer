@@ -181,6 +181,11 @@ class PlannerTests(unittest.TestCase):
             other.verify_plan(copy(plan))
         with self.assertRaises(PlannerAuthorityError):
             other.verify_plan(deepcopy(plan))
+        tampered_authority, _ = make_admission()
+        object.__setattr__(tampered_authority, "_PlanningAuthority__digests", ((digest("evil-f02"), "F-02"),) + tampered_authority._PlanningAuthority__digests[1:])
+        object.__setattr__(tampered_authority, "_PlanningAuthority__policy_digest", tampered_authority._current_policy_digest())
+        with self.assertRaises(PlannerAuthorityError):
+            tampered_authority.admit(make_inventory(), CandidateRequest("machine-1", "board-1", "disk-1", "container-1", "volume-1", digest("candidate"), digest("manifest"), digest("schema")), 1100)
 
     def test_consent_is_readiness_bound_and_one_time(self):
         authority, admission = make_admission()

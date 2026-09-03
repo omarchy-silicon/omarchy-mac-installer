@@ -1,0 +1,47 @@
+name: readonly-installer-planner
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pure-readonly-planner:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.13']
+    steps:
+      - name: Checkout without submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run pure planner tests
+        run: tests/run-readonly-planner-tests.sh
+      - name: Compile planner and run safety scan
+        run: |
+          python -m py_compile src/readonly_installer_planner.py
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          path = Path('src/readonly_installer_planner.py')
+          tree = ast.parse(path.read_text(), filename=str(path))
+          allowed = {'__future__', 'dataclasses', 'enum', 'hashlib', 'json', 're', 'threading', 'typing', 'credential_states', 'installer_transaction'}
+          forbidden = {'open', 'system', 'run', 'Popen', 'check_call', 'check_output', 'unlink', 'remove', 'rmtree'}
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  names = {alias.name.split('.')[0] for alias in node.names}
+                  if not names <= allowed:
+                      raise SystemExit(f'forbidden import: {sorted(names - allowed)}')
+              elif isinstance(node, ast.ImportFrom) and (node.module is None or node.module.split('.')[0] not in allowed):
+                  raise SystemExit(f'forbidden import: {node.module}')
+              elif isinstance(node, ast.Call):
+                  name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ''
+                  if name in forbidden:
+                      raise SystemExit(f'forbidden call: {name}')
+          print('planner AST/import/destructive scan passed')
+          PY
